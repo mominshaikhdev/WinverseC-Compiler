@@ -1,0 +1,502 @@
+// main.cpp - Winverse Compiler CLI entry point
+// Copyright (c) 2026 Momin Shaikh. All rights reserved.
+
+#define ENABLE_WIN32_LONG_PATHS 1
+#include <iostream>
+#include <string>
+#include <string_view>
+#include <filesystem>
+#include <thread>
+#include <chrono>
+#include <atomic>
+#include <vector>
+#include <algorithm>
+#include <execution>
+#include <unordered_set>
+#include <cstdlib>
+#include <windows.h>
+
+import winversec.types;
+import winversec.attributes;
+import winversec.sal;
+import winversec.preprocessor;
+import winversec.parser;
+import winversec.resolver;
+import winversec.enrich;
+import winversec.emit;
+import winversec.validate;
+import winversec.driver;
+
+struct SdkVersion {
+    std::string dir_name;
+    uint32_t major = 0;
+    uint32_t minor = 0;
+    uint32_t build = 0;
+    uint32_t revision = 0;
+    bool operator<(const SdkVersion& o) const {
+        if (major != o.major) return major < o.major;
+        if (minor != o.minor) return minor < o.minor;
+        if (build != o.build) return build < o.build;
+        return revision < o.revision;
+    }
+};
+
+static SdkVersion parse_version_dir(const std::string& dir_name) {
+    SdkVersion v;
+    v.dir_name = dir_name;
+    // Parse "10.0.26100.0" format
+    std::vector<uint32_t> parts;
+    std::string current;
+    for (char c : dir_name) {
+        if (c == '.') {
+            if (!current.empty()) {
+                try { parts.push_back(std::stoul(current)); } catch (...) {}
+                current.clear();
+            }
+        } else if (std::isdigit((unsigned char)c)) {
+            current += c;
+        }
+    }
+    if (!current.empty()) {
+        try { parts.push_back(std::stoul(current)); } catch (...) {}
+    }
+    if (parts.size() >= 1) v.major = parts[0];
+    if (parts.size() >= 2) v.minor = parts[1];
+    if (parts.size() >= 3) v.build = parts[2];
+    if (parts.size() >= 4) v.revision = parts[3];
+    return v;
+}
+
+static std::string auto_detect_sdk_root() {
+    namespace fs = std::filesystem;
+    std::vector<char> drives;
+    for (char d = 'A'; d <= 'Z'; ++d) {
+        std::string prefix = std::string(1, d) + ":\\";
+        DWORD attrs = GetFileAttributesA(prefix.c_str());
+        if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY))
+            drives.push_back(d);
+    }
+    for (char d : drives) {
+        std::string base = std::string(1, d) + ":\\";
+        for (auto& sub : {"Program Files (x86)", "Program Files"}) {
+            std::string kits = base + sub + "\\Windows Kits";
+            if (!fs::exists(kits) || !fs::is_directory(kits)) continue;
+            for (auto& entry : fs::directory_iterator(kits)) {
+                if (!entry.is_directory()) continue;
+                auto name = entry.path().filename().string();
+                bool all_digits = true;
+                for (char c : name) if (!std::isdigit((unsigned char)c)) { all_digits = false; break; }
+                if (!all_digits || name.empty()) continue;
+                auto include_dir = entry.path() / "Include";
+                if (fs::exists(include_dir) && fs::is_directory(include_dir)) {
+                    for (auto& ie : fs::directory_iterator(include_dir)) {
+                        if (ie.is_directory()) return entry.path().string();
+                    }
+                }
+            }
+        }
+    }
+    return {};
+}
+
+static std::string auto_detect_sdk_version(const std::string& sdk_root) {
+    namespace fs = std::filesystem;
+    fs::path include_dir = fs::path(sdk_root) / "Include";
+    if (!fs::exists(include_dir) || !fs::is_directory(include_dir)) return {};
+    std::vector<SdkVersion> versions;
+    for (auto& entry : fs::directory_iterator(include_dir)) {
+        if (!entry.is_directory()) continue;
+        auto name = entry.path().filename().string();
+        auto v = parse_version_dir(name);
+        if (v.major > 0) versions.push_back(v);
+    }
+    if (versions.empty()) return {};
+    std::sort(versions.begin(), versions.end());
+    
+    // Enforce minimum version 10.0.26100.0
+    SdkVersion min_ver;
+    min_ver.major = 10; min_ver.minor = 0; min_ver.build = 26100; min_ver.revision = 0;
+    auto latest = versions.back();
+    if (latest < min_ver) {
+        std::cerr << "WARNING: Latest SDK version " << latest.dir_name
+                  << " is below minimum 10.0.26100.0\n";
+    }
+    return versions.back().dir_name;
+}
+
+static void usage() {
+    std::cout << "Winverse Compiler - Win32 & Driver API Metadata Compiler\n"
+              << "Usage: winversec.exe [options]\n\n"
+              << "Options:\n"
+              << "  -sdk <path>          Windows SDK root (default: auto-detect any drive)\n"
+              << "  -version <ver>       SDK version dir (default: auto-detect latest, e.g. 10.0.26100.0)\n"
+              << "  -output <path>       Output path: dir, file.winmd, or base name (default: Windows.Win32+Wdk.winmd)\n"
+              << "  -include_drivers     Include WDK kernel-mode driver APIs (default: on)\n"
+              << "  -no_drivers          Exclude WDK driver APIs (Win32 only)\n"
+              << "  -drivers_only        Generate Windows.Wdk.winmd (driver APIs only, no Win32)\n"
+              << "  -include_dir <dir>   Extra header dir scanned for headers the SDK lacks,\n"
+              << "                       e.g. the Windows App SDK NuGet include folder. Repeatable;\n"
+              << "                       SDK-provided headers (same stem) always win, so an SDK for\n"
+              << "                       Windows 11 22H2 (22621)+ with builtin dynamic dependency\n"
+              << "                       never collides.\n"
+              << "  -include_wasdk      Auto-locate the Windows App SDK NuGet include dir(s)\n"
+              << "                       under the machine's NuGet cache (highest version wins)\n"
+              << "                       and ingest headers the SDK lacks. SDK-provided headers\n"
+              << "                       (same stem, e.g. builtin dynamic dependency on\n"
+              << "                       Windows 11 22H2 / 22621+) always win - no double decls.\n"
+              << "  -ns <h=Namespace>    Pin a header (stem) to a namespace, overriding the\n"
+              << "                       built-in table. Repeatable. Arbitrary third-party\n"
+              << "                       header fidelity is best-effort: always check the\n"
+              << "                       coverage report / Unresolved count.\n"
+              << "  -coverage <file>     Write HTML coverage report\n"
+              << "  -verbose             Verbose output\n"
+              << "  -help                Show this help\n";
+}
+
+int main(int argc, char* argv[]) {
+    SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* ep) -> LONG {
+        fprintf(stderr, "FATAL: Unhandled exception 0x%08lX at %p\n",
+                ep->ExceptionRecord->ExceptionCode, ep->ExceptionRecord->ExceptionAddress);
+        return EXCEPTION_EXECUTE_HANDLER;
+    });
+    std::string sdk;
+    std::string version_dir;
+    std::string output;
+    bool drivers = true;
+    bool drivers_only = false;
+    bool verbose = false;
+    std::string coverage;
+    std::vector<std::string> extra_dirs;
+    std::vector<std::string> ns_overrides;
+    bool include_wasdk = false;
+
+    for (int i = 1; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "-sdk" && i+1 < argc) { sdk = argv[++i]; }
+        else if (a == "-version" && i+1 < argc) { version_dir = argv[++i]; }
+        else if (a == "-output" && i+1 < argc) { output = argv[++i]; }
+        else if (a == "-include_dir" && i+1 < argc) { extra_dirs.push_back(argv[++i]); }
+        else if (a == "-ns" && i+1 < argc) { ns_overrides.push_back(argv[++i]); }
+        else if (a == "-include_wasdk") include_wasdk = true;
+        else if (a == "-include_drivers") drivers = true;
+        else if (a == "-no_drivers") drivers = false;
+        else if (a == "-drivers_only") { drivers_only = true; drivers = true; }
+        else if (a == "-coverage" && i+1 < argc) coverage = argv[++i];
+        else if (a == "-verbose") verbose = true;
+        else if (a == "-help") { usage(); return 0; }
+        else { std::cerr << "Unknown option: " << a << "\n"; usage(); return 1; }
+    }
+
+    // Resolve relative switch paths ("..\\out", "foo.winmd") against the
+    // current directory so generation works from any launch directory.
+    auto norm_path = [](std::string const& value) -> std::string {
+        if (value.size() < 2) return value;
+        if (value[1] == ':') return value;                      // drive-absolute
+        if (value[0] == '/' || value[0] == '\\') return value;  // rooted
+        std::error_code ec;
+        auto abs = std::filesystem::absolute(value, ec);
+        if (ec) return value;
+        auto canon = std::filesystem::weakly_canonical(abs, ec);
+        if (ec) return abs.string();
+        return canon.string();
+    };
+    if (!sdk.empty()) sdk = norm_path(sdk);
+    if (!output.empty()) output = norm_path(output);
+    if (!coverage.empty()) coverage = norm_path(coverage);
+    for (auto& d : extra_dirs) d = norm_path(d);
+
+    // Invoked with no arguments: print help and exit (do not auto-run a full
+    // SDK generation pass — an explicit option is required to compile).
+    if (argc <= 1) {
+        usage();
+        return 0;
+    }
+
+        if (sdk.empty()) {
+            sdk = auto_detect_sdk_root();
+            if (sdk.empty()) {
+                std::cerr << "ERROR: Could not find Windows SDK on any drive.\n"
+                          << "Use -sdk <path> to specify manually.\n";
+                return 1;
+            }
+            if (verbose) std::cout << "Auto-detected SDK: " << sdk << "\n";
+        }
+
+        if (version_dir.empty()) {
+            version_dir = auto_detect_sdk_version(sdk);
+            if (version_dir.empty()) {
+                std::cerr << "ERROR: Could not find any SDK version under " << sdk << "\n";
+                std::cerr << "Use -version <dir> to specify manually (e.g. -version 10.0.26100.0).\n";
+                return 1;
+            }
+            if (verbose) std::cout << "Auto-detected version: " << version_dir << "\n";
+        }
+
+    auto hw = std::thread::hardware_concurrency();
+    if (verbose) {
+        std::cout << "Winverse Compiler v0.1.0\n"
+                  << "SDK:  " << sdk << "\n"
+                  << "Ver:  " << version_dir << "\n"
+                  << "Drv:  " << (drivers_only ? "only" : drivers ? "yes" : "no") << "\n"
+                  << "Core: " << hw << "\n\n";
+    }
+
+    wv::State state;
+    state.include_drivers = drivers;
+    state.drivers_only = drivers_only;
+    state.verbose = verbose;
+    // -include_wasdk: auto-locate Windows App SDK NuGet include dirs under the
+    // machine's NuGet cache (NUGET_PACKAGES, then the default ~/.nuget),
+    // matching any microsoft.windowsappsdk* package id, highest version
+    // first. The include dir of each package is queued as an extra include
+    // dir; parse_sdk's SDK-stem-first dedup guarantees that an SDK which
+    // already provides the same header (builtin dynamic dependency on
+    // Windows 11 22H2 / 22621+) wins and the NuGet copy is skipped, so
+    // MddBootstrap.h etc. are never declared twice.
+    if (include_wasdk)
+    {
+        namespace fs = std::filesystem;
+        std::vector<fs::path> roots;
+        if (const char* np = std::getenv("NUGET_PACKAGES"); np && *np) roots.emplace_back(np);
+        else if (const char* hp = std::getenv("USERPROFILE"); hp && *hp) roots.emplace_back(fs::path(hp) / ".nuget" / "packages");
+        else if (const char* hh = std::getenv("HOME"); hh && *hh) roots.emplace_back(fs::path(hh) / ".nuget" / "packages");
+        bool found_any = false;
+        for (auto const& root : roots)
+        {
+            std::error_code ec;
+            if (!fs::is_directory(root, ec)) continue;
+            for (auto const& pkg : fs::directory_iterator(root, ec))
+            {
+                auto id = pkg.path().filename().string();
+                for (auto& c : id) c = (char)std::tolower((unsigned char)c);
+                if (id.rfind("microsoft.windowsappsdk", 0) != 0) continue;
+                // Newest version first (semver-ish lexicographic works for
+                // Microsoft's versioning scheme).
+                std::vector<fs::path> vers;
+                std::error_code vec;
+                for (auto const& v : fs::directory_iterator(pkg.path(), vec))
+                    if (v.is_directory()) vers.push_back(v.path());
+                std::sort(vers.begin(), vers.end(), [](auto const& a, auto const& b) { return a.filename().string() > b.filename().string(); });
+                for (auto const& v : vers)
+                {
+                    fs::path inc = v / "include";
+                    if (fs::is_directory(inc))
+                    {
+                        state.extra_include_dirs.push_back(inc);
+                        found_any = true;
+                        if (verbose) std::cout << "WASDK include: " << inc.string() << "\n";
+                        break;  // highest version with an include dir wins
+                    }
+                }
+            }
+        }
+        if (!found_any)
+            std::cerr << "WARNING: -include_wasdk: no Windows App SDK NuGet include dir found"
+                         " (looked in the NuGet cache; restore a WASDK-based project first).\n";
+    }
+    for (auto const& d : extra_dirs) state.extra_include_dirs.emplace_back(d);
+    // -ns <header=Namespace>: pin any header's items to any namespace.
+    // Header stem is lowercased for matching; namespace is taken verbatim
+    // (dots allowed). Later flags win on duplicate stems.
+    for (auto const& ov : ns_overrides)
+    {
+        auto eq = ov.find('=');
+        if (eq == std::string::npos || eq == 0 || eq + 1 == ov.size())
+        {
+            std::cerr << "WARNING: -ns expects <header=Namespace>, got: " << ov << "\n";
+            continue;
+        }
+        std::string stem = ov.substr(0, eq);
+        for (auto& c : stem) c = (char)std::tolower((unsigned char)c);
+        state.ns_overrides[stem] = ov.substr(eq + 1);
+    }
+
+    // Resolve output path
+    namespace fs = std::filesystem;
+    if (output.empty()) {
+        output = drivers_only ? "Windows.Wdk.winmd" : drivers ? "Windows.Win32+Wdk.winmd" : "Windows.Win32.winmd";
+    } else {
+        if (output.size() >= 6 && output.substr(output.size() - 6) == ".winmd") {
+            // exact file path provided
+        } else if (fs::is_directory(fs::path(output))) {
+            auto fname = drivers_only ? "Windows.Wdk.winmd" : drivers ? "Windows.Win32+Wdk.winmd" : "Windows.Win32.winmd";
+            output = (fs::path(output) / fname).string();
+        } else {
+            output += ".winmd";
+        }
+    }
+    if (drivers_only) state.asm_name = "Windows.Wdk";
+    else if (drivers) state.asm_name = "Windows.Win32+Wdk";
+    else state.asm_name = "Windows.Win32";
+    std::cout << "Out:  " << output << "\n\n";
+    auto total_start = std::chrono::steady_clock::now();
+
+    std::cout << "[1/5] Parsing headers...\n" << std::flush;
+    wv::Preprocessor pp(state);
+    wv::parse::Parser parser(state, pp);
+
+    std::atomic<bool> parsing_done{false};
+    std::thread progress_thread([&]() {
+        size_t last = 0;
+        while (!parsing_done.load()) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            auto f = state.files_parsed_atomic.load();
+            auto t = state.types_found_atomic.load();
+            auto fn = state.funcs_found_atomic.load();
+            if (f > last) {
+                last = f;
+                if (verbose) std::cerr << "\r    " << f << " files, " << t << " types, " << fn << " funcs   " << std::flush;
+            }
+        }
+    });
+
+    bool parsed = parser.parse_sdk(std::filesystem::path(sdk), version_dir);
+    parsing_done.store(true);
+    progress_thread.join();
+    auto t1 = std::chrono::steady_clock::now();
+    if (verbose) std::cerr << "\n    Parsed " << state.items.size() << " types in "
+              << std::chrono::duration_cast<std::chrono::seconds>(t1 - total_start).count() << "s\n";
+
+    // Deduplicate types by namespace+name. Headers are parsed standalone
+    // and in parallel, so the same typedef/struct name is discovered many
+    // times — and a broken duplicate (targetless alias, opaque fwd-decl) can
+    // finish before the real definition and poison it under keep-first
+    // semantics. Definition beats declaration regardless of parse order:
+    //   - an alias carrying a real target (named ref / fnptr) beats a
+    //     targetless one;
+    //   - a struct/union with fields/methods beats an empty one;
+    //   - otherwise first wins.
+    {
+        auto alias_has_target = [](wv::TDef const& d) {
+            return !d.alias_ref.name.empty() || d.alias_ref.fnptr;
+        };
+        // A PRIMITIVE-alias duplicate (elem set, no named ref: 'typedef
+        // unsigned __int64 ULONG64' -> u8) must beat a named-alias duplicate
+        // ('typedef ULONG64 X' leaves a Class with alias_ref=Class ULONG64
+        // whose own item may have lost to a targetless dup) — otherwise
+        // consumers of the primitive shape encode garbage classes (the
+        // WinSock/USBIOCTL ULONG64). Rank primitive-alias highest for
+        // Class-kind items with no members.
+        auto is_primitive_alias = [](wv::TDef const& d) {
+            return d.kind == wv::Kind::Class && d.alias_elem != wv::ET::Void
+                && d.alias_elem != wv::ET::Class && d.alias_ref.name.empty()
+                && d.fields.empty() && d.meths.empty();
+        };
+        auto item_score = [&](wv::Item const& it) {
+            int s = 0;
+            if (is_primitive_alias(it.def)) s += 4;
+            if (it.def.kind == wv::Kind::Class && alias_has_target(it.def)) s += 2;
+            if (!it.def.fields.empty() || !it.def.meths.empty()) s += 1;
+            return s;
+        };
+        std::unordered_map<std::string, size_t> seen_idx;
+        seen_idx.reserve(state.items.size());
+        std::vector<wv::Item> unique;
+        unique.reserve(state.items.size());
+        for (auto& item : state.items) {
+            auto key = item.def.ns + "." + item.def.name;
+            auto [it, inserted] = seen_idx.emplace(key, unique.size());
+            if (inserted) {
+                unique.push_back(std::move(item));
+            }
+            else if (item_score(item) > item_score(unique[it->second])) {
+                unique[it->second] = std::move(item); // definition beats declaration
+            }
+        }
+        state.items = std::move(unique);
+        if (verbose) std::cerr << "  Deduped: " << state.items.size() << " unique types\n";
+    }
+
+    // Field-less struct/union after dedup = opaque handle. In C an empty
+    // struct cannot exist and every `typedef struct TAG {} *TAG;` /
+    // pointer-to-incomplete shape is an opaque handle
+    // (RO_REGISTRATION_COOKIE, CO_MTA_USAGE_COOKIE, PACKAGEDEPENDENCY_CONTEXT).
+    // Leaving them Kind::Struct makes downstream projections skip the empty
+    // body while signatures still reference the type -> C2039/C2230
+    // cascades. Promote to Class so consumers emit `using X = void*;` and
+    // the metadata stays language-agnostic (any projection handles an
+    // opaque handle; nobody can handle a valueless struct).
+    {
+        size_t promoted = 0;
+        for (auto& item : state.items) {
+            if ((item.def.kind == wv::Kind::Struct || item.def.kind == wv::Kind::Union)
+                && item.def.fields.empty() && item.def.meths.empty()) {
+                item.def.kind = wv::Kind::Class;
+                item.def.is_union = false;
+                ++promoted;
+            }
+        }
+        if (verbose) std::cerr << "  Promoted " << promoted << " field-less structs/unions to opaque classes\n";
+    }
+
+    // Filter out items with empty names — metadata artifacts
+    {
+        size_t before = state.items.size();
+        state.items.erase(
+            std::remove_if(state.items.begin(), state.items.end(),
+                [](const wv::Item& it) {
+                    if (it.def.name.empty()) return true;
+                    if (it.def.ns.empty()) return true;
+                    // Skip metadata artifact types (empty name after last dot in ns)
+                    auto& n = it.def.name;
+                    if (n.size() == 1 && n[0] == '.') return true;
+                    return false;
+                }),
+            state.items.end());
+        size_t filtered = before - state.items.size();
+        if (filtered > 0 && verbose) std::cerr << "  Filtered: " << filtered << " empty-name types\n";
+    }
+
+    std::cout << "[2/5] Resolving types...\n";
+    {
+        wv::Resolver resolver(state);
+        resolver.resolve_all_parallel(hw);
+        resolver.compute_sizes_parallel(hw);
+    }
+    auto t2 = std::chrono::steady_clock::now();
+    if (verbose) std::cout << "  Resolved " << state.items.size() << " types ("
+              << std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() << "ms)\n";
+
+    std::cout << "[3/5] Enriching metadata...\n";
+    {
+        wv::Enricher enricher(state);
+        enricher.run_parallel(hw);
+        if (drivers) {
+            if (verbose) std::cout << "  Including driver APIs...\n";
+            wv::DriverEnricher denricher(state);
+            denricher.run();
+        }
+    }
+    auto t3 = std::chrono::steady_clock::now();
+    if (verbose) std::cout << "  Enriched (" << std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count() << "ms)\n";
+
+    std::cout << "[4/5] Emitting .winmd...\n";
+    {
+        wv::WinmdEmitter emitter(state, verbose);
+        bool ok = emitter.emit(output);
+        if (!ok) { std::cerr << "Emit failed!\n"; return 1; }
+    }
+    auto t4 = std::chrono::steady_clock::now();
+    if (verbose) std::cout << "  Written: " << output << " ("
+              << std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t3).count() << "ms)\n";
+
+    std::cout << "[5/5] Validating coverage...\n";
+    {
+        wv::Validator validator(state);
+        auto report = validator.run(std::filesystem::path(sdk), version_dir);
+        validator.print(report);
+        if (!coverage.empty()) {
+            if (validator.write_html(report, coverage))
+                std::cout << "Coverage report: " << coverage << "\n";
+            else
+                std::cerr << "Failed to write coverage report\n";
+        }
+    }
+
+    auto total_end = std::chrono::steady_clock::now();
+    std::cout << "\nTotal time: "
+              << std::chrono::duration_cast<std::chrono::seconds>(total_end - total_start).count()
+              << "s\n";
+
+    return 0;
+}
