@@ -176,7 +176,7 @@ Winverse Compiler employs a five-layer pipeline where each layer operates on a p
 | **COM interface support** | Basic COM detection | None | None | Basic — direct base class IID + vtable index |
 | **Enum flags detection** | 37,097-line manual JSON | None | None — inherits from win32metadata | Automatic bitmask pattern analysis (>=3 bits set -> flags) |
 | **Namespace model** | Flat `Apis` static class | Flat `Apis` container expansion | Flat `Windows.Wdk` hierarchy | Semantic domain grouping |
-| **Custom attribute set** | ~10 projection-specific attributes | None — projections hardcode rules | None — inherits from win32metadata | 64 defined, ~40 actively emitted |
+| **Custom attribute set** | ~10 projection-specific attributes | None — projections hardcode rules | None — inherits from win32metadata | 64 defined, all actively emitted |
 | **A/W suffix handling** | Manual remap configuration | None | None — inherits from win32metadata | Automatic suffix detection and resolution |
 | **Error recovery strategy** | ClangSharp fail-fast | N/A | WinmdGenerator fail-fast | Skip-and-continue with diagnostics |
 
@@ -436,9 +436,7 @@ the official win32metadata homes:
 | `appmodel.h` | `Windows.Win32.System.AppModel` |
 | `MddBootstrap.h` | `Windows.Win32.System.DynamicDependency` |
 
-#### Flat-C AppSDK APIs: automatic namespaces and DLL imports
-
-Every other WASDK header needs no table entry:
+**Flat-C WindowsAppSDK APIs — automatic namespaces and DLL imports:** every other WASDK header needs no table entry:
 
 - **Namespace**: `Microsoft.Windows.AppSDK.<HeaderStem>` (`MRM.h` ->
   `Microsoft.Windows.AppSDK.MRM`). `-ns` pins and the stem table above
@@ -539,7 +537,7 @@ Winverse Compiler defines 64 custom attribute types (in `attributes.ixx`) that c
 | `IoctlCodeAttribute` | **Emitted** | `uint DeviceType, uint Function, uint Method, uint Access` | Generate IOCTL constants from `CTL_CODE` |
 | `IoctlBufferingAttribute` | **Emitted** | `uint Method` | Generate buffer marshaling based on method |
 
-> **Note:** IOCTL expansion from `CTL_CODE` macros is implemented. `CTL_CODE` enum constant values are decoded at enrichment time, extracting device type, function code, buffering method, and access rights.
+> **Note:** IOCTL expansion covers both sources. `#define IOCTL_X CTL_CODE(...)` values are evaluated by the preprocessor, recorded by the parser, then materialized as single-member enums by `materialize_ioctl_consts` (`enrich.ixx`); enum-resident `IOCTL_*`/`FSCTL_*` members are decoded in `detect_ioctl_constants` at enrichment time — device type (`>> 16`), function code (`>> 2 & 0xFFF`), buffering method (`>> 14 & 3`), and access (`& 3`) — each emitting `IoctlCodeAttribute` + `IoctlBufferingAttribute`.
 
 ### Enum Attributes
 
@@ -585,7 +583,7 @@ Winverse Compiler defines 64 custom attribute types (in `attributes.ixx`) that c
 | `CallbackConventionAttribute` | **Emitted** | `uint CC` | Generate delegate calling convention |
 | `CallbackOptionalAttribute` | **Emitted** | -- | Generate nullable delegates |
 
-> **Note:** Delegate callback detection (`typedef void (CALLBACK *foo)(...)`) is implemented. Function pointer detection in struct fields (e.g., `WDF_DRIVER_CONFIG.EvtDriverDeviceAdd`) is implemented — `CallbackDelegateAttribute` is emitted for struct fields whose type resolves to a function pointer.
+> **Note:** Callback emission has three sites in `enrich_type` (`enrich.ixx`): a `Kind::Delegate` typedef (`typedef void (CALLBACK *foo)(...)`) emits `CallbackDelegateAttribute` + `CallbackConventionAttribute` carrying the typedef's calling convention; a struct field whose type resolves to a function pointer (e.g., `WDF_DRIVER_CONFIG.EvtDriverDeviceAdd`) emits `CallbackDelegateAttribute` (default convention); and a parameter typed with one of those callbacks plus `_Opt_` SAL emits `CallbackOptionalAttribute`.
 
 ### Struct Attributes
 
@@ -641,7 +639,7 @@ Winverse Compiler defines 64 custom attribute types (in `attributes.ixx`) that c
 | `PowerAttribute` | **Emitted** | `uint State` | Generate power state metadata |
 | `PnpAttribute` | **Emitted** | `uint State` | Generate PnP state metadata |
 
-> **Note:** WDK attributes are emitted from the parser via `make_*` calls in `driver.ixx`, but the enrichment pipeline (handle classification, IOCTL expansion, buffer annotation) is not yet wired for kernel-mode APIs.
+> **Note:** WDK attributes are emitted from the parser via `make_*` calls in `driver.ixx`, and the enrichment pipeline is wired for kernel-mode APIs: `enrich_type` runs over every item regardless of partition (handle classification, IOCTL expansion from `CTL_CODE`, SAL buffer/string annotation), while `enrich_extra` layers the `is_km` extras on top — `DriverType`/`WdfObject`/`DriverDispatch`, `IrpMajorFunction` from materialized `IRP_MJ_*` defines, partition `km`, and `NoThrow` on kernel functions.
 
 ### Miscellaneous Attributes
 
