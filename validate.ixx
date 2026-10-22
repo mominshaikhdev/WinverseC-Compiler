@@ -132,7 +132,7 @@ public:
         bar("Constants", r.resolved_consts, r.total_consts);
         f << "<h2>Unresolved References: " << r.unresolved_refs << "</h2>";
 
-        // ── Per-namespace API detail: every Win32 / WDK / WASDK namespace
+        // Per-namespace API detail: every Win32 / WDK / WASDK namespace
         // with its functions (signature + dll), types (kind + members),
         // constants (name + value) and contributing headers.
         struct ns_stat {
@@ -147,17 +147,16 @@ public:
         auto extra_root_hit = [&](const std::string& file) {
             for (auto const& d : st.extra_include_dirs) {
                 auto ds = d.string();
-                if (!ds.empty() && file.compare(0, ds.size(), ds) == 0) return true;
-                // case-insensitive compare for windows paths
-                if (ds.size() == file.size()) {
-                    bool eq = true;
-                    for (size_t i = 0; i < ds.size(); ++i) {
-                        char a = (char)tolower((unsigned char)ds[i]);
-                        char b = (char)tolower((unsigned char)file[i]);
-                        if (a != b) { eq = false; break; }
-                    }
-                    if (eq) return true;
+                if (ds.empty()) continue;
+                // Windows paths are case-insensitive: a plain prefix compare
+                // misses e.g. extra dir '.../include' vs file '.../Include/..'.
+                if (file.size() < ds.size()) continue;
+                bool pre = true;
+                for (size_t i = 0; i < ds.size(); ++i) {
+                    if (tolower((unsigned char)file[i]) !=
+                        tolower((unsigned char)ds[i])) { pre = false; break; }
                 }
+                if (pre) return true;
             }
             return false;
         };

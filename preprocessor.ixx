@@ -48,18 +48,30 @@ public:
                 return candidate.string();
         }
 
-        // Try each SDK include path
+        // Try each SDK include path. The same <header> names repeat
+        // thousands of times across files, and include_paths_ is frozen
+        // before the worker threads start, so cache the path-search result
+        // (hits AND misses) per thread - each fs::exists is a syscall, and
+        // without this every failed lookup walks every WASDK/NuGet dir too.
+        static thread_local std::unordered_map<std::string, std::string> res_cache;
+        if (auto ci = res_cache.find(std::string(clean)); ci != res_cache.end())
+            return ci->second;
+        std::string resolved;
         for (auto& inc : include_paths_) {
             auto candidate = inc / clean;
-            if (std::filesystem::exists(candidate))
-                return candidate.string();
+            if (std::filesystem::exists(candidate)) {
+                resolved = candidate.string();
+                break;
+            }
         }
-
-        return "";
+        res_cache.emplace(std::string(clean), resolved);
+        return resolved;
     }
 
-    // Add an include search path
+    // Add an include search path (dedup: the collect phase queues one entry
+    // per extra header, so the same NuGet include dir arrives many times)
     void add_include_path(const std::filesystem::path& p) {
+        for (auto const& e : include_paths_) if (e == p) return;
         include_paths_.push_back(p);
     }
 
@@ -77,6 +89,55 @@ public:
     // Set a define
     void set_define(const std::string& name, const std::string& value = "1") {
         defines_[name] = {name, value};
+    }
+
+    // Evaluate an integer expression fragment: a numeric literal (0x... /
+    // decimal) or the name of a previously defined object macro. Resolves
+    // one level of macro indirection recursively (FILE_DEVICE_DISK ->
+    // 0x00000007).
+    bool eval_macro_int(std::string_view s, uint32_t& out) const {
+        while (!s.empty() && (unsigned char)s.front() <= ' ') s.remove_prefix(1);
+        while (!s.empty() && (unsigned char)s.back() <= ' ') s.remove_suffix(1);
+        if (s.empty()) return false;
+        if (std::isdigit((unsigned char)s.front())) {
+            out = (uint32_t)std::strtoul(std::string(s).c_str(), nullptr, 0);
+            return true;
+        }
+        auto it = defines_.find(std::string(s));
+        if (it != defines_.end() && it->second.value != s)
+            return eval_macro_int(it->second.value, out);
+        return false;
+    }
+
+    // Evaluate CTL_CODE(DeviceType, Function, Method, Access) into its
+    // packed IOCTL code: (DeviceType << 16) | (Access << 14) |
+    // (Function << 2) | Method. Args are literals or defined macro names
+    // (FILE_DEVICE_*, METHOD_*, FILE_*_ACCESS).
+    bool eval_ctl_code(std::string_view val, uint32_t& out) const {
+        auto cp = val.find("CTL_CODE(");
+        if (cp == std::string_view::npos) return false;
+        auto open = val.find('(', cp);
+        // Split the four top-level arguments on commas.
+        std::vector<std::string> parts;
+        std::string acc;
+        int depth = 0;
+        bool closed = false;
+        for (size_t r = open + 1; r < val.size() && !closed; ++r) {
+            char c = val[r];
+            if (c == '(') { ++depth; acc += c; continue; }
+            if (c == ')') {
+                if (depth == 0) { parts.push_back(acc); closed = true; break; }
+                --depth; acc += c; continue;
+            }
+            if (c == ',' && depth == 0) { parts.push_back(acc); acc.clear(); continue; }
+            acc += c;
+        }
+        if (!closed || parts.size() != 4) return false;
+        uint32_t v[4];
+        for (int i = 0; i < 4; ++i)
+            if (!eval_macro_int(parts[i], v[i])) return false;
+        out = (v[0] << 16) | (v[3] << 14) | (v[1] << 2) | v[2];
+        return true;
     }
 
     // Undefine

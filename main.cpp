@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <execution>
 #include <unordered_set>
+#include <unordered_map>
+#include <fstream>
 #include <cstdlib>
 #include <windows.h>
 
@@ -125,7 +127,7 @@ static std::string auto_detect_sdk_version(const std::string& sdk_root) {
 }
 
 static void usage() {
-    std::cout << "Winverse Compiler - Win32 & Driver API Metadata Compiler\n"
+    std::cout << "Winverse Compiler v1.0.0.0 - Win32 & Driver API Metadata Compiler\n"
               << "Usage: winversec.exe [options]\n\n"
               << "Options:\n"
               << "  -sdk <path>          Windows SDK root (default: auto-detect any drive)\n"
@@ -151,6 +153,74 @@ static void usage() {
               << "  -coverage <file>     Write HTML coverage report\n"
               << "  -verbose             Verbose output\n"
               << "  -help                Show this help\n";
+}
+
+// Read an import library (.lib) and record exported symbol -> dll name.
+// Short import entries store null-terminated strings in file order
+// (symbols before the dll name), so symbols accumulate until a
+// "<name>.dll" string appears, then bind to it; __IMPORT_DESCRIPTOR_<X>
+// supplies the fallback. Handles multi-dll umbrella libs.
+static void scan_import_lib(const std::filesystem::path& lib,
+                            std::unordered_map<std::string, std::string>& out)
+{
+    std::error_code ec;
+    auto sz = std::filesystem::file_size(lib, ec);
+    // Skip implibs/empty/corrupt/absurd files (import libs are KBs-MBs).
+    if (ec || sz < 8 || sz > (64ull << 20)) return;
+    std::vector<char> buf((size_t)sz);
+    {
+        std::ifstream f(lib, std::ios::binary);
+        if (!f.read(buf.data(), (std::streamsize)sz)) return;
+    }
+    std::vector<std::string> pend;
+    std::string cur_dll;
+    std::string fallback_dll;
+    auto flush = [&](std::string const& dll) {
+        if (dll.empty()) return;
+        for (auto& s : pend)
+            if (!out.contains(s)) out.emplace(s, dll);
+        pend.clear();
+    };
+    auto is_ident = [](std::string const& s) {
+        if (s.empty() || s.size() > 512) return false;
+        if (!((s[0] >= 'A' && s[0] <= 'Z') || (s[0] >= 'a' && s[0] <= 'z') || s[0] == '_'))
+            return false;
+        for (char c : s)
+            if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                  (c >= '0' && c <= '9') || c == '_'))
+                return false;
+        return true;
+    };
+    size_t i = 0;
+    while (i < buf.size())
+    {
+        while (i < buf.size() && (unsigned char)buf[i] < 32) ++i;
+        size_t start = i;
+        while (i < buf.size() && (unsigned char)buf[i] >= 32 && (unsigned char)buf[i] < 127) ++i;
+        // Bytes >= 0x7F are neither gap nor printable: must advance or the
+        // outer loop spins on the same index forever.
+        if (i == start) { ++i; continue; }
+        std::string s(buf.begin() + start, buf.begin() + i);
+        if (s.size() > 4 && s.size() < 300)
+        {
+            std::string low = s;
+            for (auto& ch : low) ch = (char)std::tolower((unsigned char)ch);
+            if (low.rfind(".dll", low.size() - 4) == low.size() - 4 && is_ident(low.substr(0, low.size() - 4)))
+            {
+                if (cur_dll != s) { flush(s); cur_dll = s; }
+                continue;
+            }
+            static const std::string desc = "__IMPORT_DESCRIPTOR_";
+            if (s.rfind(desc, 0) == 0)
+            {
+                std::string mod = s.substr(desc.size());
+                if (is_ident(mod) && fallback_dll.empty()) fallback_dll = mod + ".dll";
+                continue;
+            }
+        }
+        if (is_ident(s)) pend.push_back(std::move(s));
+    }
+    flush(cur_dll.empty() ? fallback_dll : cur_dll);
 }
 
 int main(int argc, char* argv[]) {
@@ -234,7 +304,7 @@ int main(int argc, char* argv[]) {
 
     auto hw = std::thread::hardware_concurrency();
     if (verbose) {
-        std::cout << "Winverse Compiler v0.1.0\n"
+        std::cout << "Winverse Compiler v1.0.0.0\n"
                   << "SDK:  " << sdk << "\n"
                   << "Ver:  " << version_dir << "\n"
                   << "Drv:  " << (drivers_only ? "only" : drivers ? "yes" : "no") << "\n"
@@ -276,13 +346,41 @@ int main(int argc, char* argv[]) {
                 std::error_code vec;
                 for (auto const& v : fs::directory_iterator(pkg.path(), vec))
                     if (v.is_directory()) vers.push_back(v.path());
-                std::sort(vers.begin(), vers.end(), [](auto const& a, auto const& b) { return a.filename().string() > b.filename().string(); });
+                // Numeric-aware version order: plain lexicographic ranks
+                // "2.3.5" above "2.3.12", which would pick an OLD package
+                // once a component crosses a two-digit minor/patch.
+                auto ver_rank = [](const std::string& v) {
+                    std::vector<int> nums;
+                    std::string tail;
+                    size_t i = 0;
+                    while (i < v.size())
+                    {
+                        if (v[i] >= '0' && v[i] <= '9')
+                        {
+                            int n = 0;
+                            while (i < v.size() && v[i] >= '0' && v[i] <= '9')
+                            {
+                                n = n * 10 + (v[i] - '0');
+                                ++i;
+                            }
+                            nums.push_back(n);
+                        }
+                        else { tail += v[i]; ++i; }  // separators + prerelease suffix
+                    }
+                    return std::make_pair(std::move(nums), std::move(tail));
+                };
+                std::sort(vers.begin(), vers.end(), [&](auto const& a, auto const& b) {
+                    return ver_rank(a.filename().string()) > ver_rank(b.filename().string());
+                });
                 for (auto const& v : vers)
                 {
                     fs::path inc = v / "include";
                     if (fs::is_directory(inc))
                     {
                         state.extra_include_dirs.push_back(inc);
+                        // WASDK package flat-C headers -> Microsoft.Windows.AppSDK
+                        state.extra_include_ns[inc.lexically_normal().generic_string()] =
+                            "Microsoft.Windows.AppSDK";
                         found_any = true;
                         if (verbose) std::cout << "WASDK include: " << inc.string() << "\n";
                         break;  // highest version with an include dir wins
@@ -295,6 +393,34 @@ int main(int argc, char* argv[]) {
                          " (looked in the NuGet cache; restore a WASDK-based project first).\n";
     }
     for (auto const& d : extra_dirs) state.extra_include_dirs.emplace_back(d);
+    // Automatic flat-C dll discovery: scan each extra include dir's sibling
+    // NuGet lib dir (<pkg>/lib/native/<arch>) and record symbol -> dll from
+    // the import libraries; arch precedence x64 > x86 > arm64 > arm64ec.
+    {
+        namespace fs2 = std::filesystem;
+        static const char* arches[] = { "x64", "x86", "arm64", "arm64ec" };
+        for (auto const& incd : state.extra_include_dirs)
+        {
+            std::error_code ec;
+            fs2::path pkg = incd.parent_path();   // <pkg>/include -> <pkg>
+            for (auto const* arch : arches)
+            {
+                fs2::path libdir = pkg / "lib" / "native" / arch;
+                if (!fs2::is_directory(libdir, ec)) continue;
+                for (auto const& e : fs2::directory_iterator(libdir, ec))
+                {
+                    if (!e.is_regular_file(ec)) continue;
+                    auto ext = e.path().extension().string();
+                    for (auto& c : ext) c = (char)std::tolower((unsigned char)c);
+                    if (ext != ".lib") continue;
+                    scan_import_lib(e.path(), state.dll_imports);
+                    if (verbose) std::cout << "scanned import lib: " << e.path().string()
+                                           << " (" << state.dll_imports.size() << " symbols so far)\n";
+                }
+                break;  // first (highest-precedence) arch present wins
+            }
+        }
+    }
     // -ns <header=Namespace>: pin any header's items to any namespace.
     // Header stem is lowercased for matching; namespace is taken verbatim
     // (dots allowed). Later flags win on duplicate stems.
@@ -387,6 +513,12 @@ int main(int argc, char* argv[]) {
             if (is_primitive_alias(it.def)) s += 4;
             if (it.def.kind == wv::Kind::Class && alias_has_target(it.def)) s += 2;
             if (!it.def.fields.empty() || !it.def.meths.empty()) s += 1;
+            // A COM interface (Kind::Iface) carries its vtable methods and
+            // IID; the C forward declaration `typedef interface IFoo IFoo;`
+            // is a memberless Kind::Class alias whose +2 alias-target bonus
+            // would otherwise beat the real interface, dropping every
+            // ComMethod/vtable row for that interface.
+            if (it.def.kind == wv::Kind::Iface) s += 3;
             return s;
         };
         std::unordered_map<std::string, size_t> seen_idx;
@@ -399,8 +531,28 @@ int main(int argc, char* argv[]) {
             if (inserted) {
                 unique.push_back(std::move(item));
             }
-            else if (item_score(item) > item_score(unique[it->second])) {
-                unique[it->second] = std::move(item); // definition beats declaration
+            else {
+                // A COM coclass duplicate carries an irreplaceable CLSID
+                // (class DECLSPEC_UUID("...")). Whichever duplicate wins
+                // the dedup, graft the UUID onto the survivor — dropping
+                // it left 1850 of 1858 coclasses without ComCoClass (a
+                // targetless empty Class alias of the same name typically
+                // finishes first and wins the tie).
+                auto& w = unique[it->second].def;
+                auto& d = item.def;
+                if (d.kind == wv::Kind::Class && !d.com_iid.empty()
+                    && w.kind == wv::Kind::Class && w.com_iid.empty()) {
+                    w.com_iid = d.com_iid;
+                    w.is_com_interface = true;
+                }
+                else if (w.kind == wv::Kind::Class && !w.com_iid.empty()
+                         && d.kind == wv::Kind::Class && d.com_iid.empty()) {
+                    d.com_iid = w.com_iid;
+                    d.is_com_interface = true;
+                }
+                if (item_score(item) > item_score(unique[it->second])) {
+                    unique[it->second] = std::move(item); // definition beats declaration
+                }
             }
         }
         state.items = std::move(unique);
@@ -460,6 +612,7 @@ int main(int argc, char* argv[]) {
     std::cout << "[3/5] Enriching metadata...\n";
     {
         wv::Enricher enricher(state);
+        enricher.set_sdk_version(version_dir);
         enricher.run_parallel(hw);
         if (drivers) {
             if (verbose) std::cout << "  Including driver APIs...\n";

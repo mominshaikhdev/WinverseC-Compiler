@@ -6,7 +6,7 @@ A high-performance Win32 and Driver API metadata compiler, implemented in C++23 
 
 Winverse Compiler parses the Windows SDK (version 26100 and later), including user-mode, kernel-mode, and shared headers, and produces a single `.winmd` binary conforming to the ECMA-335 metadata standard. The output includes every Win32 function, struct, enum, constant, callback, COM interface, and driver API — each annotated with custom attributes that capture semantics invisible to standard metadata formats: handle ownership, buffer relationships, IOCTL codes, calling conventions, import library mappings, and more.
 
-The generated `.winmd` is directly consumable by any language with an ECMA-335 reader — C#, Rust, Zig, Python, D, Dart, Beef, Go, TypeScript, and others — without requiring language-specific code generators or hardcoded binding rules.
+The generated `.winmd` is directly consumable by any language with an ECMA-335 reader — C#, Rust, Zig, Python, D, Dart, Beef, Go, TypeScript, and others — without requiring language-specific code generators or per-language glue.
 
 ## Motivation
 
@@ -98,7 +98,7 @@ Winverse Compiler employs a five-layer pipeline where each layer operates on a p
   |    structured BufferSemanticsInfo for each parameter                   |
   |  * IID resolution from DEFINE_GUID; direct base class tracking       |
   |  * Function-to-DLL import library mapping for P/Invoke, DllImport,  |
-  |    and native language bindings (verified against SDK .lib files)     |
+  |    and native language projections (verified against SDK .lib files)  |
   |  * Semantic function categorization by header source (FileSystem,    |
   |    Registry, Graphics, Networking, Security, etc.)                   |
   |  * A/W suffix resolution: CreateFileA/CreateFileW -> CreateFile      |
@@ -107,7 +107,10 @@ Winverse Compiler employs a five-layer pipeline where each layer operates on a p
   |                                                                      |
   |  Implemented and wired:                                              |
   |  * Buffer semantics (SAL -> BufferSemantics attributes)              |
-  |  * IOCTL expansion (CTL_CODE -> structured IoctlCode attributes)    |
+  |  * IOCTL expansion (CTL_CODE -> structured IoctlCode attributes)     |
+  |  * COM coclass CLSIDs (class DECLSPEC_UUID -> ComCoClass)            |
+  |  * IRP major-function codes (IRP_MJ_* -> IrpMajorFunction)           |
+  |  * Optional-callback SAL (_In_opt_ params -> CallbackOptional)       |
   |  * Function pointer detection in struct fields                       |
   |  * String null-termination attributes                                |
   +-----------------------------------+----------------------------------+
@@ -125,7 +128,7 @@ Winverse Compiler employs a five-layer pipeline where each layer operates on a p
   |    type are consolidated into a single type definition with          |
   |    per-architecture size attributes                                  |
   |  * Custom attribute emission: 64 Winverse attribute types are        |
-  |    defined; ~40 are actively emitted as ECMA-335 CustomAttribute     |
+  |    defined; all are actively emitted as ECMA-335 CustomAttribute    |
   |    rows with proper blob encoding                                    |
   |  * Semantic namespace grouping: functions are placed in domain-      |
   |    appropriate namespaces (Windows.Win32.FileSystem,                 |
@@ -433,6 +436,19 @@ the official win32metadata homes:
 | `appmodel.h` | `Windows.Win32.System.AppModel` |
 | `MddBootstrap.h` | `Windows.Win32.System.DynamicDependency` |
 
+#### Flat-C AppSDK APIs: automatic namespaces and DLL imports
+
+Every other WASDK header needs no table entry:
+
+- **Namespace**: `Microsoft.Windows.AppSDK.<HeaderStem>` (`MRM.h` ->
+  `Microsoft.Windows.AppSDK.MRM`). `-ns` pins and the stem table above
+  take precedence.
+- **DLL import**: each package's import libs (`lib/native/x64/*.lib`,
+  then x86/arm64/arm64ec) are scanned for exported symbols; the dll name
+  comes from the import descriptor in the binary (`MrmCreateResourceManager`
+  -> `MRM.dll`), so new flat-C APIs get their import the day they ship.
+  Consulted after the built-in dll table.
+
 ### Extra Header Directories (-include_dir)
 
 ```batch
@@ -479,9 +495,7 @@ winversec.exe -include_drivers -coverage coverage.html
 
 ## Custom Attributes Reference
 
-Winverse Compiler defines 64 custom attribute types (in `attributes.ixx`) that capture Win32 semantics invisible to standard metadata. The current pipeline emits a subset of these — each section below marks which attributes are **actively emitted** vs **defined but not yet wired into the pipeline**.
-
-> **Note:** Attributes marked "Defined only" have full `make_*` factory functions and ECMA-335 CustomAttribute encoding, but are not yet called from the enricher/emitter pipeline. They are reserved for future semantic enrichment passes.
+Winverse Compiler defines 64 custom attribute types (in `attributes.ixx`) that capture Win32 semantics invisible to standard metadata. The current pipeline emits all of them — each section below records the emission status (verified with `WINVERSE_ATTRTRACE=1`).
 
 ### Handle Attributes
 
@@ -514,9 +528,9 @@ Winverse Compiler defines 64 custom attribute types (in `attributes.ixx`) that c
 |---|---|---|---|
 | `ComInterfaceAttribute` | **Emitted** | `Guid Iid, uint Flags` | Generate COM interface wrappers |
 | `ComMethodAttribute` | **Emitted** | `uint VTableIndex` | Generate vtable method calls |
-| `ComPropertyAttribute` | Defined only | `uint GetIndex, uint SetIndex` | Generate property accessors |
-| `ComEventAttribute` | Defined only | `Guid Iid` | Generate event source wrappers |
-| `ComCoClassAttribute` | Defined only | -- | Generate coclass metadata |
+| `ComPropertyAttribute` | **Emitted** | `uint GetIndex, uint SetIndex` | Generate property accessors |
+| `ComEventAttribute` | **Emitted** | `Guid Iid` | Generate event source wrappers |
+| `ComCoClassAttribute` | **Emitted** | `string Clsid` | Generate coclass metadata |
 
 ### IOCTL Attributes
 
@@ -549,7 +563,7 @@ Winverse Compiler defines 64 custom attribute types (in `attributes.ixx`) that c
 |---|---|---|---|
 | `StringEncodingAttribute` | **Emitted** | `uint Encoding` | Generate string marshaling |
 | `StringNullAttribute` | **Emitted** | `uint Semantics` | Generate null-termination handling |
-| `StringMaxLengthAttribute` | Defined only | `string Expr` | Generate string length calculations |
+| `StringMaxLengthAttribute` | **Emitted** | `string Expr` | Generate string length calculations |
 
 ### Error Attributes
 
@@ -569,7 +583,7 @@ Winverse Compiler defines 64 custom attribute types (in `attributes.ixx`) that c
 |---|---|---|---|
 | `CallbackDelegateAttribute` | **Emitted** | `Guid Iid` | Generate delegate types |
 | `CallbackConventionAttribute` | **Emitted** | `uint CC` | Generate delegate calling convention |
-| `CallbackOptionalAttribute` | Defined only | -- | Generate nullable delegates |
+| `CallbackOptionalAttribute` | **Emitted** | -- | Generate nullable delegates |
 
 > **Note:** Delegate callback detection (`typedef void (CALLBACK *foo)(...)`) is implemented. Function pointer detection in struct fields (e.g., `WDF_DRIVER_CONFIG.EvtDriverDeviceAdd`) is implemented — `CallbackDelegateAttribute` is emitted for struct fields whose type resolves to a function pointer.
 
@@ -641,7 +655,7 @@ Winverse Compiler defines 64 custom attribute types (in `attributes.ixx`) that c
 
 ### Projection Owner Guidance
 
-Language projections read the `.winmd` and generate type-safe bindings. The `.winmd` contains semantic attributes (HandleKind, DllImport, BufferSemantics, StructLayout, etc.) that drive projection logic.
+Language projections read the `.winmd` and generate type-safe projections. The `.winmd` contains semantic attributes (HandleKind, DllImport, BufferSemantics, StructLayout, etc.) that drive projection logic.
 
 ## License
 

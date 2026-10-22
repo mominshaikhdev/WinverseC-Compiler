@@ -50,6 +50,36 @@ enum class SalKind : uint8_t {
     NullTerminated, // _Null_terminated_
     Nullable,       // _Nullable_
     NotNull,        // _Notnull_ (non-nullable)
+    FunctionClass,  // _Function_class_(X) — semantic class of a callback
+    DriverAnno,     // __drv_* (WDK driver-model annotation: __drv_allocatesMem,
+                    //   __drv_holdsMut, __drv_maxIRQL, ...). Unclassified these
+                    //   derailed `typedef ... __drv_allocatesMem(Mem) PVOID
+                    //   NAME(...)`: the peek strips ONE underscore, so the
+                    //   scanned name is `_drv_allocatesMem`; classify returned
+                    //   None, parse_all stopped, and read_type ate the token
+                    //   as the return type — the statement was dropped and
+                    //   every consumer of NAME* failed C2039 (Ntddk
+                    //   RTL_AVL_ALLOCATE_ROUTINE, ...).
+    Irql,           // _IRQL_requires_/_IRQL_requires_max_/_IRQL_requires_same_
+                    //   WDK IRQL contract. Unclassified these derailed
+                    //   `typedef _Function_class_(X) _IRQL_requires_*(LVL) RET
+                    //   NAME(...)`: parse_all stopped at the IRQL token and
+                    //   read_type ate it as the return type, so the callback
+                    //   fell to the function parser instead of the delegate
+                    //   branch (EVT_*/PRM_* emitted as extern "C" fn, then
+                    //   C2039 in every struct field typed `NAME*`).
+};
+
+// Semantic class of a function-pointer typedef, from _Function_class_(X).
+// The SDK uses it to label WDK dispatch routines: the real IRP major-function
+// code lives in the annotation argument (e.g. _Function_class_(IRP_MJ_CREATE)),
+// never in an enum member — which is why name heuristics saw only the handful
+// of dispatch routines with "Dispatch" in the name.
+struct FunctionClassInfo {
+    std::string raw;      // full argument text, e.g. "IRP_MJ_DEVICE_CONTROL"
+    std::string category; // leading identifier, e.g. "IRP_MJ"
+    uint32_t code = 0;    // parsed numeric code when the argument is numeric
+    bool has_code = false;
 };
 
 // Parsed SAL annotation
@@ -195,8 +225,20 @@ public:
         return bs;
     }
 
+public:
+    // True when the identifier (without its leading underscore) is a SAL
+    // annotation the parser understands. Used by the declaration-specifier
+    // skipper to leave SAL tokens in place for parse_all.
+    static bool is_sal_annotation(std::string_view name) {
+        return classify(name) != SalKind::None;
+    }
+
 private:
-    SalKind classify(std::string_view name) {
+    static SalKind classify(std::string_view name) {
+        // SDK spellings carry a trailing underscore (_In_, _Out_opt_,
+        // _Check_return_): the scanned ident is "In_", "Out_opt_", ...
+        // Normalize once so every exact-match below sees the bare stem.
+        if (!name.empty() && name.back() == '_') name.remove_suffix(1);
         if (name == "In")                    return SalKind::In;
         if (name == "Out")                   return SalKind::Out;
         if (name == "Inout")                 return SalKind::InOut;
@@ -236,6 +278,30 @@ private:
         if (name.starts_with("Field_range")) return SalKind::Field;
         if (name.starts_with("On_failure"))  return SalKind::OnFailure;
         if (name.starts_with("When"))        return SalKind::When;
+        if (name.starts_with("Function_class")) return SalKind::FunctionClass;
+        // WDK driver-model annotations: the scanned name keeps one leading
+        // underscore (`__drv_allocatesMem` -> `_drv_allocatesMem`).
+        if (name.starts_with("_drv") || name.starts_with("drv_")) return SalKind::DriverAnno;
+        // Legacy (pre-SAL2) annotations keep one leading underscore too
+        // (`__in_opt` -> `_in_opt`). Without these, parse_all stops at the
+        // annotation and read_type eats it as the parameter type - the
+        // signature then derails and the row absorbs garbage params
+        // (newdev.h DiShowUpdateDriver).
+        if (name.starts_with("_deref_"))                return SalKind::InOut;
+        if (name.starts_with("_inout"))                 return SalKind::InOut;
+        if (name == "_in" || name.starts_with("_in_"))  return SalKind::In;
+        if (name == "_out" || name.starts_with("_out_")) return SalKind::Out;
+        // SAL2 side annotations _Post_* / _Pre_* (handleapi.h declares
+        // `CloseHandle(_In_ _Post_ptr_invalid_ HANDLE hObject)`): the peek
+        // strips one leading underscore, so classify sees `Post_ptr_invalid`.
+        // Unclassified, the parse derailed exactly like legacy SAL: read_type
+        // ate the token as the parameter type and the signature gained a
+        // phantom second param (CloseHandle emitted with 2 args -> C2660 in
+        // winrt_base). Federated is an inert marker kind: skipped like any
+        // other annotation, no buffer semantics attached.
+        if (name.starts_with("Post_") || name.starts_with("Pre_"))
+            return SalKind::Federated;
+        if (name.starts_with("IRQL_"))         return SalKind::Irql;
         return SalKind::None;
     }
 
@@ -266,9 +332,32 @@ private:
         return result;
     }
 
+    // Whitespace AND comments: annotations are newline-separated and the
+    // SDK freely interleaves trailing explanations —
+    //     _IRQL_requires_(HIGH_LEVEL) // HIGH_LEVEL is best approximation of DIRQL
+    //     _IRQL_requires_same_
+    // A bare whitespace skip stopped at the `/`, parse_all bailed with the
+    // remaining annotations (and the return type) unparsed, and the whole
+    // typedef was dropped (wdm.h KSERVICE_ROUTINE missing from the winmd ->
+    // every consumer failed C2039).
     void skip_ws(std::string_view src, size_t& pos) {
-        while (pos < src.size() && (src[pos] == ' ' || src[pos] == '\t' || src[pos] == '\r' || src[pos] == '\n'))
-            ++pos;
+        while (pos < src.size()) {
+            char c = src[pos];
+            if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+                ++pos;
+            }
+            else if (c == '/' && pos + 1 < src.size() && src[pos + 1] == '/') {
+                while (pos < src.size() && src[pos] != '\n') ++pos;
+            }
+            else if (c == '/' && pos + 1 < src.size() && src[pos + 1] == '*') {
+                pos += 2;
+                while (pos + 1 < src.size() && !(src[pos] == '*' && src[pos + 1] == '/')) ++pos;
+                pos = (pos + 1 < src.size()) ? pos + 2 : src.size();
+            }
+            else {
+                break;
+            }
+        }
     }
 };
 

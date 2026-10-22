@@ -440,7 +440,19 @@ private:
     std::vector<uint8_t> encode_field_sig(const FDef& f, std::string const& owner = {}) {
         std::vector<uint8_t> sig;
         sig.push_back(0x06);
-        encode_element_type(sig, f.type, f.ref, owner);
+        if (f.arr_n > 0) {
+            // Fixed-size array field: ELEMENT_TYPE_ARRAY (0x14) + element
+            // type + ArrayShape { Rank=1, NumSizes=1, Size=N } per
+            // ECMA-335 II.23.2.14 — the only way FieldSig can carry a
+            // fixed bound (SZARRAY has none).
+            sig.push_back(0x14);
+            encode_element_type(sig, f.type, f.ref, owner);
+            write_compressed(sig, (uint32_t)1);   // Rank
+            write_compressed(sig, (uint32_t)1);   // NumSizes
+            write_compressed(sig, f.arr_n);       // Size[0]
+        } else {
+            encode_element_type(sig, f.type, f.ref, owner);
+        }
         return sig;
     }
 
@@ -587,14 +599,15 @@ private:
         std::vector<uint8_t> blob;
         blob.push_back(0x01);
         blob.push_back(0x00);
-        write_compressed(blob, a.positional.size());
+        // ECMA-335 II.23.3: the blob is Prolog (0x0001) followed directly by
+        // the fixed args — the arg count is NOT in the blob (readers derive it
+        // from the ctor signature). No positional count here.
         for (auto& v : a.positional) encode_attr_value(blob, v);
         write_compressed(blob, a.args.size());
         for (auto& [k, v] : a.args) {
             blob.push_back(0x53);
             encode_attr_value_type(blob, v);
             auto name_bytes = std::vector<uint8_t>(k.begin(), k.end());
-            name_bytes.push_back(0);
             write_compressed(blob, name_bytes.size());
             blob.insert(blob.end(), name_bytes.begin(), name_bytes.end());
             encode_attr_value(blob, v);
@@ -622,8 +635,9 @@ private:
                 break;
             }
             case AttrVal::Kind::String: {
+                // SerString = compressed byte-length + UTF-8 bytes, NO NUL
+                // terminator inside the counted length (ECMA-335 II.23.3).
                 auto bytes = std::vector<uint8_t>(v.str_val.begin(), v.str_val.end());
-                bytes.push_back(0);
                 write_compressed(blob, bytes.size());
                 blob.insert(blob.end(), bytes.begin(), bytes.end());
                 break;
@@ -715,12 +729,20 @@ private:
                 uint16_t flags = (uint16_t)MA::Pub;
                 if (item.def.kind == Kind::Func) flags |= (uint16_t)MA::PInvoke;
 
-                // Delegate typedefs must carry the standard ECMA-335 shape:
-                // one method named "Invoke" (any language projection looks
-                // for it by name). Naming it after the typedef broke every
-                // downstream delegate consumer.
-                std::string meth_name = (item.def.kind == Kind::Delegate)
-                    ? std::string("Invoke") : item.def.name;
+                // Delegates: the standard ECMA-335 shape is one method named
+                // "Invoke" (any language projection looks for it by name).
+                // Interface methods: their REAL name (MSig.name — set by the
+                // parser in vtable order; naming every method after the type
+                // made consumers read them as constructors: C2533).
+                // Plain C function items: the name lives on the TDef (the
+                // type IS the function) — fall back when MSig.name is empty.
+                std::string meth_name;
+                if (item.def.kind == Kind::Delegate)
+                    meth_name = "Invoke";
+                else if (!meth.name.empty())
+                    meth_name = meth.name;
+                else
+                    meth_name = item.def.name;
 
                 method_def_table_.push_back({
                     0,
@@ -792,9 +814,9 @@ private:
         for (size_t i = 0; i < st.items.size(); ++i) {
             for (auto& a : st.items[i].def.attributes) {
                 uint32_t mr_idx = resolve_attr_type_ref(a);
-                custom_attribute_table_.push_back({
-                    0x02, (uint32_t)(i + 1),  // parent: tag 2 = TypeDef, 1-based row
-                    0x03, mr_idx,       // type: tag 3 = MemberRef
+            custom_attribute_table_.push_back({
+                0x03, (uint32_t)(i + 1),  // parent: tag 3 = TypeDef (HasCustomAttribute coded index: 2=TypeRef, 3=TypeDef), 1-based row
+                0x03, mr_idx + 1,   // type: tag 3 = MemberRef, 1-based row
                     add_blob(encode_custom_attr_blob(a)),
                 });
                 emit_stats.attrs_emitted++;

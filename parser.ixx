@@ -31,6 +31,18 @@ import winversec.sal;
 
 static thread_local std::string g_last_ident;
 
+// Declaration-specifier capture sink: skip_decl_specifiers records
+// inline/__forceinline/__declspec(deprecated) hits here; the declaration
+// parsers consume them into TDef::fn_flags. Thread-local because header
+// parsing runs on multiple threads.
+static thread_local uint32_t g_decl_flags_sink = 0;
+static thread_local std::string g_decl_msg_sink;
+
+// Workers record evaluated #define constants (CTL_CODE IOCTLs, IRP_MJ_
+// codes) into shared State vectors concurrently — plain push_back from
+// several threads corrupts the vector.
+static std::mutex g_define_record_mtx;
+
 static constexpr size_t FILE_ITER_LIMIT = 10000000;
 static constexpr size_t BODY_ITER_LIMIT = 500000;
 static constexpr size_t PARAM_ITER_LIMIT = 50000;
@@ -144,14 +156,21 @@ public:
 
         auto worker = [&]() {
             _set_se_translator(seh_translator);
-            Preprocessor pp = sal_init_pp;
-            SalParser sal;
 
             while (true) {
                 size_t i = idx.fetch_add(1);
                 if (i >= files.size()) break;
 
                 try {
+                    // Fresh preprocessor state PER FILE. Carrying defines
+                    // across files (the old layout) made active-gating
+                    // order-dependent: a worker that parsed ntddk.h first
+                    // (defines _NTDDK_) saw wdm.h's whole body — DRIVER_OBJECT,
+                    // IRP, every dispatch typedef — under `#ifndef _NTDDK_`
+                    // and skipped the file. Which worker got which files is
+                    // a race, so km coverage varied run to run.
+                    Preprocessor pp = sal_init_pp;
+                    SalParser sal;
                     auto fname = files[i].string();
                     std::error_code fec;
                     auto fsize = std::filesystem::file_size(files[i], fec);
@@ -319,10 +338,10 @@ private:
 
             if (c == '#') {
                 auto line_start = pos + 1;
-                auto line_end = src.find('\n', line_start);
-                if (line_end == std::string_view::npos) line_end = src.size();
-                handle_pp(src.substr(line_start, line_end - line_start), pp, ifdef_stack, active);
-                skip_to_eol(src, pos);
+                size_t dir_end = line_start;
+                auto directive = join_continued(src, line_start, dir_end);
+                handle_pp(directive, pp, ifdef_stack, active);
+                pos = dir_end;
                 continue;
             }
 
@@ -334,6 +353,28 @@ private:
                 continue;
             }
 
+            // `extern "C" {` spelled through macros: WDF_EXTERN_C_START
+            // (netpacketqueue.h, udecx*.h - immediately before the first
+            // EVT_ callback typedef) and the ICU U_CDECL_BEGIN/END pair.
+            // The parser reads raw text (macros are never rewritten), so
+            // these land as bare identifiers: the following typedef gets
+            // swallowed by skip_to_next_statement and the callback type
+            // vanishes (C2039 EVT_PACKET_QUEUE_START / C2061
+            // URegexMatchCallback in every consumer). Skip the token.
+            if (active && (match_w(src, pos, "WDF_EXTERN_C_START") ||
+                           match_w(src, pos, "WDF_EXTERN_C_END") ||
+                           match_w(src, pos, "EXTERN_C_START") ||
+                           match_w(src, pos, "EXTERN_C_END") ||
+                           match_w(src, pos, "U_CDECL_BEGIN") ||
+                           match_w(src, pos, "U_CDECL_END") ||
+                           match_w(src, pos, "__BEGIN_DECLS") ||
+                           match_w(src, pos, "__END_DECLS"))) {
+                while (pos < src.size() && src[pos] != '_' &&
+                       !std::isalnum((unsigned char)src[pos])) ++pos;
+                while (pos < src.size() &&
+                       (std::isalnum((unsigned char)src[pos]) || src[pos] == '_')) ++pos;
+                continue;
+            }
             if (match_w(src, pos, "extern")) {
                 // extern "C" { ... } is just C linkage - parse the block normally
                 // extern "SomeDLL" { ... } is DLL import vars - skip it
@@ -355,6 +396,32 @@ private:
                     skip_extern_block(src, pos);
                 }
                 continue;
+            }
+            // SAL annotations can sit BEFORE the `typedef` keyword (oprghdlr.h):
+            //     _Function_class_(ACPI_OP_REGION_CALLBACK)
+            //     _IRQL_requires_same_
+            //     typedef PVOID EXPORT ACPI_OP_REGION_CALLBACK(...);
+            // Leading annotations drop the statement into try_parse_func,
+            // which records a bogus extern "C" function instead of the
+            // callback delegate - every consumer typed with
+            // `ACPI_OP_REGION_CALLBACK*` then fails C2061. Peek past a
+            // leading run of `_`-prefixed annotations; if `typedef`
+            // follows, route the statement to the typedef parser.
+            {
+                size_t peek = pos;
+                int ann_count = 0;
+                while (peek < src.size() && src[peek] == '_' && ann_count < 16) {
+                    size_t before = peek;
+                    auto id = read_ident(src, peek);
+                    if (id.empty() || peek == before) break;
+                    skip_ws(src, peek);
+                    if (peek < src.size() && src[peek] == '(') skip_balanced(src, peek, '(', ')');
+                    skip_ws_comments(src, peek);
+                    ++ann_count;
+                }
+                if (ann_count > 0 && match_w(src, peek, "typedef")) {
+                    pos = peek;
+                }
             }
             if (match_w(src, pos, "typedef")) {
                 parse_typedef(src, pos, filename, pp, sal, active, items, nss, types_out);
@@ -567,6 +634,72 @@ private:
                     continue;
                 }
                 pos = saved_pos;
+                // COM coclass declarations carry their CLSID here:
+                //     class DECLSPEC_UUID("78a51822-...") ProcessDebugManager;
+                // A bodyless class whose only declspec is a UUID is the
+                // C++ spelling of an MIDL `coclass` — the SDK's authoritative
+                // CLSID source (mirrors the uuid(...) on coclass blocks in the
+                // .idl, which the scanner skips). Capture it as a Kind::Class
+                // carrying com_iid so enrich emits ComCoClass + Guid (the
+                // emission path already keys on kind==Class && !com_iid.empty()).
+                {
+                    size_t cp = pos + 5;
+                    std::string_view cp_uuid;
+                    // Scan declspecs + the class name; bail on any body/inheritance.
+                    for (int g = 0; g < 8; ++g) {
+                        skip_ws_comments(src, cp);
+                        if (match_w(src, cp, "DECLSPEC_UUID")) {
+                            cp += 13; skip_ws(src, cp);
+                            if (cp < src.size() && src[cp] == '(') {
+                                ++cp; skip_ws(src, cp);
+                                if (cp < src.size() && src[cp] == '"') {
+                                    ++cp;
+                                    size_t qs = cp;
+                                    while (cp < src.size() && src[cp] != '"') ++cp;
+                                    cp_uuid = src.substr(qs, cp - qs);
+                                    if (cp < src.size()) ++cp;
+                                }
+                                skip_ws(src, cp);
+                                if (cp < src.size() && src[cp] == ')') ++cp;
+                            }
+                            continue;
+                        }
+                        // Any other __declspec / attribute before the name
+                        // is tolerated; a bare identifier NOT followed by '('
+                        // is the class name — rewind so the read_ident below
+                        // captures it (the name sits on the next line after
+                        // the DECLSPEC_UUID macro).
+                        if (src[cp] == '_' || std::isalpha((unsigned char)src[cp])) {
+                            size_t before = cp;
+                            read_ident(src, cp);
+                            skip_ws_comments(src, cp);
+                            if (cp < src.size() && src[cp] == '(') {
+                                skip_balanced(src, cp, '(', ')');
+                                continue;
+                            }
+                            cp = before;
+                        }
+                        break;
+                    }
+                    skip_ws_comments(src, cp);
+                    auto cname = read_ident(src, cp);
+                    skip_ws_comments(src, cp);
+                    // Bodyless, no inheritance, carries a UUID -> coclass.
+                    bool bodyless = cp < src.size() && src[cp] == ';';
+                    if (!cname.empty() && !cp_uuid.empty() && bodyless) {
+                        std::string ns = map_ns(filename);
+                        TDef td; td.kind = Kind::Class; td.ns = ns; td.name = std::string(cname);
+                        td.attr = TA::Pub; td.source_header = filename;
+                        td.is_com_interface = true;
+                        td.com_iid = std::string(cp_uuid);
+                        items.push_back({std::move(td), pp.current_arch(), filename});
+                        nss.insert(ns);
+                        ++types_out;
+                        ++cp; // consume ';'
+                        pos = cp;
+                        continue;
+                    }
+                }
                 // C++ class definitions (GDI+ SizeF/PointF, ...) carry
                 // constructors, member functions and inheritance - pure C++
                 // artifacts with no C ABI. Emit them neither as structs nor
@@ -576,16 +709,51 @@ private:
                 // functions that collided with same-named structs).
                 {
                     size_t p = pos + 5;
+                    // Decoration MACROS can sit between `class` and the
+                    // name (ChString.h: `class POLARITY CHString`). The
+                    // macro name is not followed by another identifier -
+                    // skip tokens that are, so the real name is found and
+                    // the body is actually skipped (otherwise the parser
+                    // resumes mid-declaration and every member leaks as a
+                    // free extern "C" function: CHSTRING's GetData/Init/
+                    // AllocCopy... plus a missing CHString type = C2039).
+                    for (int g = 0; g < 8; ++g) {
+                        skip_ws(src, p);
+                        size_t look = p;
+                        auto tok = read_ident(src, look);
+                        if (tok.empty()) break;
+                        skip_ws(src, look);
+                        // another identifier follows -> `tok` was a macro
+                        if (look < src.size() &&                            (std::isalpha((unsigned char)src[look]) || src[look] == '_')) {
+                            p = look;
+                            continue;
+                        }
+                        break;
+                    }
                     skip_ws(src, p);
-                    read_ident(src, p); // class name
+                    auto real_name = read_ident(src, p);
                     skip_ws(src, p);
                     if (p < src.size() && src[p] == '<') skip_balanced(src, p, '<', '>');
                     skip_ws(src, p);
                     if (p < src.size() && src[p] == ':') { while (p < src.size() && src[p] != '{' && src[p] != ';') ++p; }
-                    if (p < src.size() && src[p] == '{') skip_balanced(src, p, '{', '}');
+                    bool has_body = p < src.size() && src[p] == '{';
+                    if (has_body) skip_balanced(src, p, '{', '}');
                     skip_ws(src, p);
                     if (p < src.size() && src[p] == ';') ++p;
                     pos = p;
+                    // Record the class as an opaque struct so consumers
+                    // typed with it (CHSTRARR holds CHString** fields,
+                    // PROVIDER signatures) still resolve; the body stays
+                    // unmodeled.
+                    if (has_body && !real_name.empty()) {
+                        std::string ns = map_ns(filename);
+                        TDef td; td.kind = Kind::Struct; td.ns = ns;
+                        td.name = std::string(real_name); td.attr = TA::Pub;
+                        td.source_header = filename;
+                        items.push_back({std::move(td), pp.current_arch(), filename});
+                        nss.insert(ns);
+                        ++types_out;
+                    }
                 }
                 continue;
             }
@@ -669,27 +837,37 @@ private:
                 auto nm = tr(after.substr(0, sp));
                 auto val = tr(after.substr(sp + 1));
                 if (!nm.empty() && nm.front() != '(') {
-                    if (getenv("WV_DEBUG") && (nm == "_WIN32_WINNT" || nm == "WINVER" || nm == "NTDDI_VERSION"))
-                        std::fprintf(stderr, "[wv] #define %.*s = '%.*s' (active=%d)\n",
-                            (int)nm.size(), nm.data(), (int)val.size(), val.data(), (int)active);
                     pp.set_define(std::string(nm), std::string(val));
+                    // IOCTL/FSCTL codes are #define'd through the CTL_CODE
+                    // function-like macro, which never becomes an enum
+                    // member — evaluate and record them for the enricher.
+                    if ((nm.starts_with("IOCTL_") || nm.starts_with("FSCTL_")) &&
+                        val.find("CTL_CODE(") != std::string_view::npos) {
+                        uint32_t code = 0;
+                        if (pp.eval_ctl_code(val, code)) {
+                            std::lock_guard<std::mutex> lk(g_define_record_mtx);
+                            pp.st.ioctl_consts.push_back({ std::string(nm), code });
+                        }
+                    }
+                    // IRP major-function codes: `#define IRP_MJ_CREATE 0x00`
+                    // in wdm.h — never enum members, so record them for the
+                    // enricher to materialize (IrpMajorFunction attr).
+                    if (nm.rfind("IRP_MJ_", 0) == 0 && nm != "IRP_MJ_MAXIMUM_FUNCTION") {
+                        uint32_t code = 0;
+                        if (pp.eval_macro_int(val, code)) {
+                            std::lock_guard<std::mutex> lk(g_define_record_mtx);
+                            pp.st.irp_mj_consts.push_back({ std::string(nm), code });
+                        }
+                    }
                 }
             } else if (!after.empty()) {
                 auto nm = tr(after);
                 if (!nm.empty() && nm.front() != '(') {
-                    if (getenv("WV_DEBUG") && (nm == "_WIN32_WINNT" || nm == "WINVER" || nm == "NTDDI_VERSION"))
-                        std::fprintf(stderr, "[wv] #define %.*s = 1 (active=%d)\n",
-                            (int)nm.size(), nm.data(), (int)active);
                     pp.set_define(std::string(nm));
                 }
             }
         } else if (t.starts_with("undef")) {
             if (active) {
-                if (getenv("WV_DEBUG")) {
-                    auto nm = tr(t.substr(5));
-                    if (nm == "_WIN32_WINNT" || nm == "WINVER" || nm == "NTDDI_VERSION")
-                        std::fprintf(stderr, "[wv] #undef %.*s (active=%d)\n", (int)nm.size(), nm.data(), (int)active);
-                }
                 pp.undefine(tr(t.substr(5)));
             }
         } else if (t.starts_with("ifdef")) {
@@ -770,8 +948,16 @@ private:
         // consumer that typed a struct field with the true name). Skip
         // decl-specifiers and SAL annotations first so read_type sees the
         // actual return type.
-        skip_decl_specifiers(src, pos);
-        sal.parse_all(src, pos);
+        g_decl_flags_sink = 0;
+        g_decl_msg_sink.clear();
+        skip_decl_specifiers(src, pos, true);
+        // The no-pointer-star callback form (`typedef _Function_class_(X)
+        // RET NAME(...)`) reaches the delegate branch below; the semantic
+        // class annotation is consumed here by parse_all, so capture it.
+        std::string typedef_fn_class;
+        for (auto const& ann : sal.parse_all(src, pos)) {
+            if (ann.kind == SalKind::FunctionClass) typedef_fn_class = ann.count_expr;
+        }
         auto type = read_type(src, pos);
         skip_ws(src, pos);
         // Decoration macros interleave with pointer stars between the
@@ -834,6 +1020,7 @@ private:
             TDef ftd; ftd.kind = Kind::Delegate; ftd.ns = fns; ftd.name = std::string(name);
             ftd.attr = TA::Pub; ftd.is_callback = true;
             ftd.source_header = file;
+            ftd.fn_class = std::move(typedef_fn_class);
             MSig fsig; fsig.ret = type.elem; fsig.ret_r = type.ref;
             fsig.cc = CC::Std; fsig.params = std::move(params);
             ftd.meths.push_back(std::move(fsig));
@@ -949,6 +1136,8 @@ private:
                 if (td.alias_ref.name == dname && td.alias_ref.ptr == 0)
                     { td.alias_elem = ET::Void; td.alias_ref = TRef{}; }
                 td.source_header = file;
+                td.fn_flags = g_decl_flags_sink;
+                td.deprecation_msg = g_decl_msg_sink;
                 items.push_back({std::move(td), pp.current_arch(), file});
                 nss.insert(ns);
                 ++types_out;
@@ -1088,6 +1277,8 @@ private:
                                                  : (is_union ? Kind::Union : Kind::Struct);
                 td.ns = ns; td.name = name; td.attr = TA::Pub; td.is_union = is_union && !opaque_handle;
                 td.source_header = file;
+                td.fn_flags = g_decl_flags_sink;
+                td.deprecation_msg = g_decl_msg_sink;
                 items.push_back({std::move(td), pp.current_arch(), file});
                 nss.insert(ns);
                 ++types_out;
@@ -1187,7 +1378,31 @@ private:
                         nss.insert(td.ns);
                         // Member alias after the closing brace: "} DUMMYUNIONNAME;"
                         skip_ws(src, pos);
+                        size_t alias_probe = pos;
                         auto member_alias = read_ident(src, pos);
+                        // parse_struct_body's tail-alias scan has ALREADY
+                        // consumed any real alias AND the declaration's
+                        // terminating ';' ("};") before returning — so a
+                        // non-empty ident here is the NEXT member's leading
+                        // token, not an alias. wdm.h's
+                        // OB_PRE_OPERATION_INFORMATION:
+                        //     union { ... };
+                        //     _In_ PVOID Object;
+                        // made the SAL annotation the hoisted field's name;
+                        // _In_ expands to nothing at C++ compile (C2208 on
+                        // the anonymous union in every consumer). A real
+                        // alias declarator is followed by ';' (or an array
+                        // /'='/',' suffix) — anything else is not an alias:
+                        // rewind so the outer field loop parses it.
+                        if (!member_alias.empty())
+                        {
+                            size_t vp = pos;
+                            skip_ws(src, vp);
+                            bool declarator = vp < limit &&
+                                (src[vp] == ';' || src[vp] == '[' ||
+                                 src[vp] == '=' || src[vp] == ',');
+                            if (!declarator) { pos = alias_probe; member_alias = {}; }
+                        }
                         skip_ws(src, pos);
                         if (pos < limit && src[pos] == ';') ++pos;
                         // Record the by-value member so the outer struct keeps
@@ -1216,17 +1431,88 @@ private:
             size_t field_start = pos;
             auto ftype = read_type(src, pos);
             skip_ws(src, pos);
+            // Member functions inside struct bodies (WindowsNumerics.impl.h
+            // `_WINDOWS_NUMERICS_CONSTEXPR_ static float2 zero();`) are not
+            // data members: recording them as fields emits a by-value
+            // member of the enclosing type still being defined (C2460 on
+            // float2::zero). Skip the parameter list + optional body and
+            // record nothing.
+            {
+                size_t probe = pos;
+                auto mname = read_ident(src, probe);
+                skip_ws(src, probe);
+                if (!mname.empty() && probe < limit && src[probe] == '(') {
+                    skip_balanced(src, probe, '(', ')');
+                    skip_ws(src, probe);
+                    if (probe < limit && src[probe] == '{') skip_balanced(src, probe, '{', '}');
+                    skip_ws(src, probe);
+                    if (probe < limit && src[probe] == ';') ++probe;
+                    pos = probe;
+                    continue;
+                }
+                pos = field_start + (pos - field_start); // no-op; probe only
+            }
+            // Decoration macros interleave between the type and the field
+            // name (`struct wavehdr_tag FAR *lpNext;` in mmsystem.h's
+            // wavehdr_tag): without this the macro becomes the FIELD NAME
+            // (`wavehdr_tag FAR;`) and the real name is dropped - C2460
+            // 'wavehdr_tag::FAR' in every consumer. Skip deco macros and
+            // stars the same way parse_param_list does.
+            uint32_t decl_stars = 0;
+            for (int guard = 0; guard < 8; ++guard) {
+                skip_ws(src, pos);
+                bool progressed = false;
+                for (auto const& dm : { "FAR", "NEAR", "far", "near", "__far", "__near", "_FAR", "_NEAR", "__unaligned", "UNALIGNED" }) {
+                    if (match_w(src, pos, dm)) { pos += std::strlen(dm); skip_ws(src, pos); progressed = true; break; }
+                }
+                if (!progressed && pos < limit && src[pos] == '*') { ++decl_stars; ++pos; skip_ws(src, pos); progressed = true; }
+                if (!progressed) break;
+            }
             auto fname = read_ident(src, pos);
 
             if (fname.empty()) {
-                skip_to_char(src, pos, ';');
+                // Macro-expansion debris with no ';' (wdm.h's
+                // GENERAL_LOOKASIDE_LAYOUT expands to the real members,
+                // so the raw body shows a bare macro name right before
+                // the closing brace). Stop at the struct's '}' as well
+                // as the next ';' — plain skip_to_char ran past the
+                // brace and re-parsed the rest of the file as fields of
+                // this struct (391KB of wdm.h lost, including every
+                // IRP_MJ_ define below it).
+                skip_to_char3(src, pos, ';', '}', ';');
                 if (pos < limit && src[pos] == ';') ++pos;
-                if (pos == field_start) { if (pos < limit) ++pos; }
+                if (pos == field_start) { if (pos < limit && src[pos] != '}') ++pos; }
                 continue;
             }
 
             skip_ws(src, pos);
-            if (pos < limit && src[pos] == '[') skip_balanced(src, pos, '[', ']');
+            uint32_t field_arr = 0;
+            if (pos < limit && src[pos] == '[')
+            {
+                if (pos + 1 < limit && src[pos + 1] == '[')
+                {
+                    // C++ attribute [[...]] — skip as before.
+                    skip_balanced(src, pos, '[', ']');
+                }
+                else
+                {
+                    // Fixed array bound `T name[N];` — keep a PURELY numeric
+                    // N (macro bounds like [ANYSIZE_ARRAY] / [countof(x)] /
+                    // [sizeof x] are not constant-folded here and stay 0,
+                    // preserving the old scalar behavior).
+                    size_t br = pos + 1;
+                    std::string num;
+                    while (br < limit && src[br] != ']' && src[br] != '[' && src[br] != ';')
+                    {
+                        if (std::isdigit((unsigned char)src[br])) num.push_back(src[br]);
+                        else if (src[br] != ' ') { num.clear(); break; }
+                        ++br;
+                    }
+                    if (br < limit && src[br] == ']' && !num.empty() && num.size() <= 9)
+                        field_arr = (uint32_t)std::strtoul(num.c_str(), nullptr, 10);
+                    skip_balanced(src, pos, '[', ']');
+                }
+            }
             skip_ws(src, pos);
             if (pos < limit && src[pos] == ':') {
                 skip_balanced(src, pos, ':', ';');
@@ -1234,20 +1520,24 @@ private:
             skip_ws(src, pos);
             if (pos < limit && src[pos] == '=') {
                 ++pos;
-                skip_to_char(src, pos, ';');
+                // Initializer running to the closing brace without a
+                // ';' — same pass-over hazard as the debris branch.
+                skip_to_char3(src, pos, ';', '}', ';');
             }
             skip_ws(src, pos);
             if (pos < limit && src[pos] == ';') ++pos;
 
             FDef fd; fd.name = fname; fd.attr = FA::Pub;
             fd.type = ftype.elem; fd.ref = std::move(ftype.ref);
+            fd.ref.ptr += decl_stars;
+            fd.arr_n = field_arr;
             // Macro-heavy headers leave parse debris: `void const*` splits
             // into a void-typed field named 'const_' (RPCDCEP's
             // RPC_CLIENT_INTERFACE), which no projection can emit (C2182
             // 'this use of void is not valid'). A bare void field is always
             // debris — drop it here at the parse level.
             if (fd.type == ET::Void && fd.ref.name.empty() && fd.ref.ptr == 0) {
-                skip_to_char(src, pos, ';');
+                skip_to_char3(src, pos, ';', '}', ';');
                 continue;
             }
             // Paired #ifdef/#else branches both active after flattening
@@ -1384,6 +1674,23 @@ private:
                     ++pos; skip_ws(src, pos);
                     val = read_const_expr(src, pos);
                 }
+                // Trailing member comments holding commas: d3d12umddi.h ends
+                // its last enumerator with no comma and a comment,
+                //     D3D12DDI_STATIC_BORDER_COLOR_OPAQUE_WHITE_UINT  // 1u,1u,1u,1u
+                // and the bare skip_to_char3 below stopped at the comma
+                // INSIDE that comment, re-parsing "1u" as a member named
+                // "1u" (C2143/C2059 'constant' in D3D12UMDDI). Comments
+                // cannot carry a real terminator, so skip them first.
+                for (;;) {
+                    skip_ws(src, pos);
+                    if (pos + 1 < src.size() && src[pos] == '/' && src[pos + 1] == '/') {
+                        pos += 2; while (pos < src.size() && src[pos] != '\n') ++pos; continue;
+                    }
+                    if (pos + 1 < src.size() && src[pos] == '/' && src[pos + 1] == '*') {
+                        pos += 2; skip_block_comment(src, pos); continue;
+                    }
+                    break;
+                }
                 skip_to_char3(src, pos, ',', '}', ';');
                 if (pos < src.size() && src[pos] == ',') ++pos;
 
@@ -1407,6 +1714,39 @@ private:
                      std::vector<Item>& items, std::set<std::string>& nss) {
         if (!active) { skip_to_next_statement(src, pos); return; }
         skip_ws(src, pos);
+        // _Function_class_(X) labels the callback's semantic class
+        // (DRIVER_DISPATCH, DRIVER_INITIALIZE, ...). The SDK carries no other
+        // dispatch metadata: IRP slot codes are #defines and the typedef
+        // name is often a bare alias. Capture it for the enricher.
+        std::string fn_class;
+        {
+            for (int guard = 0; guard < 8; ++guard) {
+                skip_ws(src, pos);
+                if (pos >= src.size() || src[pos] != '_') break;
+                size_t s2 = pos;
+                ++pos;
+                while (pos < src.size() && (std::isalnum((unsigned char)src[pos]) || src[pos] == '_')) ++pos;
+                bool is_fc = src.substr(s2 + 1, pos - s2 - 1).starts_with("Function_class");
+                skip_ws(src, pos);
+                if (pos < src.size() && src[pos] == '(') {
+                    ++pos;
+                    size_t a0 = pos;
+                    int depth = 1;
+                    while (pos < src.size() && depth > 0) {
+                        if (src[pos] == '(') ++depth;
+                        else if (src[pos] == ')') --depth;
+                        if (depth > 0) ++pos;
+                    }
+                    if (is_fc) {
+                        auto args = src.substr(a0, pos - a0);
+                        while (!args.empty() && (unsigned char)args.front() <= ' ') args.remove_prefix(1);
+                        while (!args.empty() && (unsigned char)args.back() <= ' ') args.remove_suffix(1);
+                        fn_class.assign(args);
+                    }
+                    if (pos < src.size()) ++pos; // ')'
+                }
+            }
+        }
         auto ret = read_type(src, pos);
         skip_ws(src, pos);
         if (pos < src.size() && src[pos] == '(') ++pos;
@@ -1429,11 +1769,40 @@ private:
         TDef td; td.kind = Kind::Delegate; td.ns = ns; td.name = name;
         td.attr = TA::Pub; td.is_callback = true;
         td.source_header = file;
+        td.fn_class = std::move(fn_class);
         MSig sig; sig.ret = ret.elem; sig.ret_r = std::move(ret.ref);
         sig.cc = CC::Def; sig.params = std::move(params);
         td.meths.push_back(std::move(sig));
         items.push_back({std::move(td), pp.current_arch(), file});
         nss.insert(ns);
+    }
+
+    // Join backslash-continued directive lines into one logical line:
+    // `#define X a \` + `b` must reach handle_pp as `#define X a b`.
+    // Previously only the first physical line was handled — continuation
+    // lines fell through to the type parsers as fake code (a macro body's
+    // `union {` opened a real parse that swallowed 394KB of wdm.h), losing
+    // every #define below it: IRP_MJ_* codes and most IOCTL/FSCTL constants,
+    // whose CTL_CODE calls span lines, never reached the recorder.
+    // Returns the joined text; end_out = offset of the final newline (or
+    // src.size()) — advance pos there so no continuation line leaks.
+    static std::string join_continued(std::string_view src, size_t line_start, size_t& end_out) {
+        std::string dir;
+        size_t seg = line_start;
+        size_t nl = std::string_view::npos;
+        while (true) {
+            nl = src.find('\n', seg);
+            size_t seg_end = (nl == std::string_view::npos) ? src.size() : nl;
+            size_t e = seg_end;
+            while (e > seg && src[e - 1] == '\r') --e;
+            bool cont = (e > seg && src[e - 1] == '\\');
+            dir.append(src, seg, (cont ? e - 1 : e) - seg);
+            if (!cont || nl == std::string_view::npos) break;
+            dir.push_back(' ');
+            seg = nl + 1;
+        }
+        end_out = (nl == std::string_view::npos) ? src.size() : nl;
+        return dir;
     }
 
     // Skip # preprocessor lines, properly evaluating #ifdef/#ifndef/#if/#else/#endif nesting
@@ -1446,54 +1815,53 @@ private:
             if (pos >= src.size() || src[pos] != '#') return;
 
             auto line_start = pos + 1;
-            auto line_end = src.find('\n', line_start);
-            if (line_end == std::string_view::npos) line_end = src.size();
-            auto directive = src.substr(line_start, line_end - line_start);
+            size_t dir_end = line_start;
+            auto directive = join_continued(src, line_start, dir_end);
             auto t = tr(directive);
 
             if (t.starts_with("ifdef")) {
                 local_ifdef_stack.push_back(local_active);
                 local_active = local_active && pp.eval_ifdef(tr(t.substr(5)));
-                skip_to_eol(src, pos);
+                pos = dir_end;
                 continue;
             } else if (t.starts_with("ifndef")) {
                 local_ifdef_stack.push_back(local_active);
                 local_active = local_active && !pp.eval_ifdef(tr(t.substr(6)));
-                skip_to_eol(src, pos);
+                pos = dir_end;
                 continue;
             } else if (t.starts_with("if ")) {
                 local_ifdef_stack.push_back(local_active);
                 local_active = local_active && pp.eval_if(tr(t.substr(3)));
-                skip_to_eol(src, pos);
+                pos = dir_end;
                 continue;
             } else if (t.starts_with("elif")) {
                 if (!local_ifdef_stack.empty()) {
                     auto prev = local_ifdef_stack.back();
                     local_active = prev && !local_active && pp.eval_if(tr(t.substr(4)));
                 }
-                skip_to_eol(src, pos);
+                pos = dir_end;
                 continue;
             } else if (t.starts_with("else")) {
                 if (!local_ifdef_stack.empty()) {
                     auto prev = local_ifdef_stack.back();
                     local_active = prev && !local_active;
                 }
-                skip_to_eol(src, pos);
+                pos = dir_end;
                 continue;
             } else if (t.starts_with("endif")) {
                 if (!local_ifdef_stack.empty()) {
                     local_active = local_ifdef_stack.back();
                     local_ifdef_stack.pop_back();
                 }
-                skip_to_eol(src, pos);
+                pos = dir_end;
                 continue;
             } else if (t.starts_with("pragma") || t.starts_with("error") || t.starts_with("warning") || t.starts_with("line") || t.starts_with("define") || t.starts_with("undef") || t.starts_with("include")) {
-                skip_to_eol(src, pos);
+                pos = dir_end;
                 continue;
             }
 
-            // Unknown # directive — skip
-            skip_to_eol(src, pos);
+            // Unknown # directive — skip (honouring continuations)
+            pos = dir_end;
         }
     }
 
@@ -1502,8 +1870,6 @@ private:
                         std::vector<Item>& items, std::set<std::string>& nss, size_t& funcs_out) {
         if (!active) return false;
         size_t saved = pos;
-        if (getenv("WV_DEBUG")) std::fprintf(stderr, "[wv] try_parse_func at '%s'\n",
-            std::string(src.substr(pos, (std::min<size_t>)(70, src.size() - pos))).c_str());
         if (try_parse_func_core(src, pos, file, pp, sal, items, nss, funcs_out))
             return true;
         // Generic recovery for decl shapes the first pass cannot read: a
@@ -1598,8 +1964,6 @@ private:
             auto ret_r = read_type(src, pos);
             ret = std::move(ret_r.ref);
             if (pos == type_start) {
-                if (getenv("WV_DEBUG")) std::fprintf(stderr, "[wv] func-read_type-fail at '%s'\n",
-                    std::string(src.substr(pos, (std::min<size_t>)(40, src.size() - pos))).c_str());
                 pos = saved; return false;
             }
         }
@@ -1615,17 +1979,28 @@ private:
 
         auto name = read_ident(src, pos);
         if (name.empty()) {
-            if (getenv("WV_DEBUG")) std::fprintf(stderr, "[wv] func-name-fail ret='%s' next='%s'\n",
-                std::string(src.substr(type_start, (std::min<size_t>)(30, src.size() - type_start))).c_str(),
-                std::string(src.substr(pos, (std::min<size_t>)(40, src.size() - pos))).c_str());
             pos = saved; return false;
         }
         skip_ws(src, pos);
 
         if (pos >= src.size() || src[pos] != '(') {
-            if (getenv("WV_DEBUG")) std::fprintf(stderr, "[wv] func-paren-fail name='%s' next='%s'\n", std::string(name).c_str(),
-                std::string(src.substr(pos, (std::min<size_t>)(40, src.size() - pos))).c_str());
             pos = saved; return false;
+        }
+        // Unexpanded function-like macro debris: D2D1EffectHelpers.h's
+        // D2D1_*_BINDING macro bodies leave CONCAT(...) / D2D_ENTRY(...)
+        // in the flattened text and they parse as bogus functions
+        // (C2039/C2065 in every consumer). Real APIs are never ALL-CAPS:
+        // skip the invocation whole (DEFINE_DEVOPGUID precedent above).
+        {
+            bool has_lower = false, has_upper = false;
+            for (char c : name) {
+                if (c >= 'a' && c <= 'z') { has_lower = true; break; }
+                if (c >= 'A' && c <= 'Z') has_upper = true;
+            }
+            if (has_upper && !has_lower) {
+                skip_to_next_statement(src, pos);
+                return true;
+            }
         }
         ++pos;
 
@@ -1674,6 +2049,8 @@ private:
                     TDef td; td.kind = Kind::Func; td.ns = ns; td.name = name;
                     td.attr = TA::Pub; td.source_header = file;
                     td.meths.push_back(std::move(sig));
+                    td.fn_flags = g_decl_flags_sink;
+                    td.deprecation_msg = g_decl_msg_sink;
                     items.push_back({std::move(td), pp.current_arch(), file});
                     nss.insert(ns);
                     ++funcs_out;
@@ -1692,6 +2069,8 @@ private:
         TDef td; td.kind = Kind::Func; td.ns = ns; td.name = name;
         td.attr = TA::Pub; td.source_header = file;
         td.meths.push_back(std::move(sig));
+        td.fn_flags = g_decl_flags_sink;
+        td.deprecation_msg = g_decl_msg_sink;
         items.push_back({std::move(td), pp.current_arch(), file});
         nss.insert(ns);
         ++funcs_out;
@@ -1707,8 +2086,15 @@ private:
         if (match_w(src, pos, "DECLARE_INTERFACE")) { pos += 17; }
         else if (match_w(src, pos, "DECLARE_INTERFACE_")) { pos += 18; }
         else         if (match_w(src, pos, "MIDL_INTERFACE")) { pos += 14; }
+        // MIDL_INTERFACE_ / DECLARE_INTERFACE_ carry the trailing underscore
+        // as part of the token; match_w already matched the longer spelling
+        // above, but a bare `MIDL_INTERFACE` followed by `_` is a different
+        // macro (e.g. MIDL_INTERFACE_ID) — consume the underscore so the
+        // paren scan below starts at the IID.
+        if (pos < src.size() && src[pos] == '_') ++pos;
         skip_ws(src, pos);
         std::string com_iid;
+        std::string base_iface;
         if (pos < src.size() && src[pos] == '(') {
             ++pos;
             skip_ws(src, pos);
@@ -1718,29 +2104,143 @@ private:
                 while (pos < src.size() && src[pos] != '"') ++pos;
                 com_iid = std::string(src.substr(start, pos - start));
                 if (pos < src.size()) ++pos;
+            } else {
+                // DECLARE_INTERFACE_(Name, Base) — unquoted paren carries
+                // the interface name and (optionally) its COM base.
+                auto id1 = read_ident(src, pos);
+                skip_ws(src, pos);
+                if (!id1.empty() && pos < src.size() && src[pos] == ',') {
+                    ++pos;
+                    skip_ws(src, pos);
+                    base_iface = std::string(read_ident(src, pos));
+                    skip_ws(src, pos);
+                }
+                (void)id1;
             }
             skip_ws(src, pos);
             if (pos < src.size() && src[pos] == ')') ++pos;
         }
         skip_ws(src, pos);
 
+        // The interface name (and often an inheritance clause) sits BETWEEN
+        // the IID paren and the body brace:
+        //     MIDL_INTERFACE("AB310581-...") IShellItemArray : public IUnknown
+        //     { ... };
+        // The old code required '{' immediately after the IID, so every
+        // real COM interface fell into the no-body branch and was dropped.
+        std::string iface_name;
+        {
+            auto scan = pos;
+            bool after_colon = false;
+            while (scan < src.size() && src[scan] != '{' && src[scan] != ';') {
+                if (std::isspace((unsigned char)src[scan])) { ++scan; continue; }
+                if (src[scan] == ':') { after_colon = true; ++scan; continue; }
+                if (src[scan] == '(') { skip_balanced(src, scan, '(', ')'); continue; }
+                auto id = read_ident(src, scan);
+                if (id.empty()) { ++scan; continue; }
+                // access specifier after ':' — the real base follows
+                if (id == "public" || id == "private" || id == "protected" || id == "struct")
+                    continue;
+                if (after_colon) {
+                    if (base_iface.empty()) base_iface = std::string(id);
+                } else if (iface_name.empty()) {
+                    iface_name = std::string(id);
+                }
+            }
+            pos = scan;
+        }
+
         if (pos < src.size() && src[pos] == '{') {
-            auto name = read_ident_at_last(saved, src);
+            if (iface_name.empty()) {
+                // Fallback: last identifier before the body brace.
+                auto head = src.substr(saved, pos - saved);
+                size_t p = head.size();
+                while (p > 0 && !(std::isalnum((unsigned char)head[p - 1]) || head[p - 1] == '_')) --p;
+                size_t e = p;
+                while (e > 0 && (std::isalnum((unsigned char)head[e - 1]) || head[e - 1] == '_')) --e;
+                iface_name = std::string(head.substr(e, p - e));
+            }
+            auto name = iface_name;
             ++pos;
             std::string ns = map_ns(file);
             TDef td; td.kind = Kind::Iface; td.ns = ns; td.name = name;
-            td.attr = TA::Pub; td.is_com_interface = false;
+            td.attr = TA::Pub;
+            td.is_com_interface = !com_iid.empty() || !base_iface.empty();
             td.source_header = file;
             td.com_iid = std::move(com_iid);
+            if (!base_iface.empty()) td.ifaces.push_back({ "", std::move(base_iface) });
 
+            // Parse the body: methods become meths entries in vtable order
+            // (ComMethod attributes carry the index; property/event pairing
+            // uses the names). STDMETHOD(X)(params) PURE and
+            // `virtual ret cc X(params) = 0;` are the two SDK spellings.
+            SalParser sal;
             size_t iter = 0;
             while (pos < src.size() && src[pos] != '}') {
                 if (++iter > BODY_ITER_LIMIT) { skip_to_char(src, pos, '}'); break; }
-                skip_ws(src, pos);
+                skip_ws_comments(src, pos);
                 if (pos >= src.size() || src[pos] == '}') break;
                 if (src[pos] == '#') { skip_to_eol(src, pos); continue; }
+                // C++ access labels head MIDL interface bodies
+                // (`{ public: virtual HRESULT ... }`). Unhandled, the label
+                // poisoned the first method's name parse and the rollback
+                // skipped it wholesale — single-method interfaces ended up
+                // with methods=0.
+                {
+                    size_t lbl_save = pos;
+                    auto lbl = read_ident(src, pos);
+                    if (lbl == "public" || lbl == "private" || lbl == "protected") {
+                        skip_ws(src, pos);
+                        if (pos < src.size() && src[pos] == ':') ++pos;
+                        continue;
+                    }
+                    pos = lbl_save;
+                }
+                if (match_w(src, pos, "STDMETHOD")) {
+                    pos += 9; skip_ws(src, pos);
+                    std::string mname;
+                    if (pos < src.size() && src[pos] == '(') {
+                        ++pos; skip_ws(src, pos);
+                        mname = std::string(read_ident(src, pos));
+                        skip_ws(src, pos);
+                        if (pos < src.size() && src[pos] == ')') ++pos;
+                    }
+                    skip_ws(src, pos);
+                    MSig sig; sig.has_this = true; sig.cc = CC::Std;
+                    sig.ret = ET::I4; sig.ret_r.name = "HRESULT";
+                    if (pos < src.size() && src[pos] == '(') {
+                        ++pos;
+                        parse_param_list_with_sal(src, pos, sig, sal);
+                    }
+                    sig.name = std::move(mname);
+                    td.meths.push_back(std::move(sig));
+                    skip_to_char(src, pos, ';');
+                    if (pos < src.size() && src[pos] == ';') ++pos;
+                    continue;
+                }
+                size_t mstart = pos;
                 skip_calling_convention(src, pos);
-                skip_decl_specifiers(src, pos);
+                skip_decl_specifiers(src, pos, true);
+                sal.parse_all(src, pos);
+                auto ret_r = read_type(src, pos);
+                skip_ws(src, pos);
+                skip_calling_convention(src, pos);
+                skip_ws(src, pos);
+                auto mname = read_ident(src, pos);
+                skip_ws(src, pos);
+                if (mname.empty() || pos >= src.size() || src[pos] != '(') {
+                    pos = mstart;
+                    skip_to_char(src, pos, ';');
+                    if (pos < src.size() && src[pos] == ';') ++pos;
+                    continue;
+                }
+                MSig sig; sig.has_this = true; sig.cc = CC::Std;
+                sig.ret = ret_r.elem; sig.ret_r = std::move(ret_r.ref);
+                ++pos; // '('
+                parse_param_list_with_sal(src, pos, sig, sal);
+                sig.name = std::string(mname);
+                td.meths.push_back(std::move(sig));
+                skip_ws(src, pos);
                 skip_to_char(src, pos, ';');
                 if (pos < src.size() && src[pos] == ';') ++pos;
             }
@@ -1806,12 +2306,8 @@ private:
             skip_ws(src, pos);
             if (pos >= src.size() || src[pos] == ')') break;
             size_t pstart = pos;
-            skip_decl_specifiers(src, pos);
-            if (getenv("WV_DEBUG")) std::fprintf(stderr, "[wv] pSAL after-declspec '%.28s'\n",
-                pos < src.size() ? std::string(src.substr(pos, (std::min<size_t>)(28, src.size() - pos))).c_str() : "<end>");
+            skip_decl_specifiers(src, pos, true);
             auto sal_anns = sal.parse_all(src, pos);
-            if (getenv("WV_DEBUG")) std::fprintf(stderr, "[wv] pSAL after-sal n=%zu '%.28s'\n", sal_anns.size(),
-                pos < src.size() ? std::string(src.substr(pos, (std::min<size_t>)(28, src.size() - pos))).c_str() : "<end>");
             skip_ws(src, pos);
             auto pt = read_type(src, pos);
             // Fold declarator stars separated by no-op macros:
@@ -1843,11 +2339,28 @@ private:
                 pd.sal_buffer_info = (uint32_t)bs.kind | ((uint32_t)bs.is_byte_count << 8);
                 pd.sal_count_param = bs.count_param;
                 pd.sal_count_expression = bs.count_expression;
+                for (auto const& ann : sal_anns) {
+                    switch (ann.kind) {
+                        case SalKind::InOpt:
+                        case SalKind::OutOpt:
+                        case SalKind::InOutOpt:
+                            // Optional parameter. This mapping did not exist
+                            // at all — the CallbackOptional gate (callback
+                            // type + PA::Opt) could never open.
+                            pd.attr = (PA)((uint16_t)pd.attr | (uint16_t)PA::Opt);
+                            break;
+                        case SalKind::CheckReturn:
+                        case SalKind::MustInspect: pd.sal_flags |= SF_CHECK_RETURN; break;
+                        case SalKind::NullTerminated: pd.sal_flags |= SF_NULL_TERM; break;
+                        case SalKind::NotNull: pd.sal_flags |= SF_NOT_NULL; break;
+                        case SalKind::Nullable:
+                        case SalKind::RetMaybenull: pd.sal_flags |= SF_MAYBE_NULL; break;
+                        case SalKind::Success: pd.sal_flags |= SF_SUCCESS; break;
+                        default: break;
+                    }
+                }
             }
-            if (getenv("WV_DEBUG")) std::fprintf(stderr, "[wv] param#%zu elem=%d ref='%s' ptr=%u name='%s' next='%.24s'\n",
-                sig.params.size(), (int)pt.ref.elem, pt.ref.name.c_str(), pt.ref.ptr,
-                std::string(pn).c_str(),
-                pos < src.size() ? std::string(src.substr(pos, (std::min<size_t>)(24, src.size() - pos))).c_str() : "<end>");
+
             sig.pt.push_back(std::move(pt.ref));
             sig.params.push_back(std::move(pd));
             skip_ws(src, pos);
@@ -1955,6 +2468,7 @@ private:
                 bool is_unsigned = false; bool have_sign = false;
                 int width = 0;              // 0 = unspecified (int), 1 = short, 2 = long, 3 = long long
                 bool explicit_width = false; // __intN sets width directly
+                bool char_width = false;     // final 'char' in [un]signed char
                 for (;;) {
                     skip_ws(src, pos);
                     if (!have_sign && match_w(src, pos, "unsigned")) { is_unsigned = true; have_sign = true; pos += 8; continue; }
@@ -1979,9 +2493,19 @@ private:
                     }
                     if (match_w(src, pos, "short"))  { pos += 5; width = 1; continue; }
                     if (match_w(src, pos, "int"))    { pos += 3; continue; } // 'int' adds nothing
+                    // 'unsigned char' / 'signed char' — nothing valid follows,
+                    // so this is the sequence's last word. Without it the loop
+                    // breaks at 'unsigned' and 'char' leaks out as the FIELD
+                    // NAME (GUID's `unsigned char Data4[8]` became a uint32
+                    // field named 'char_').
+                    if (match_w(src, pos, "char"))   { pos += 4; char_width = true; continue; }
                     break;
                 }
-                if (explicit_width) {
+                if (char_width) {
+                    // [un]signed char: 8-bit, signedness from the prefix.
+                    r.elem = is_unsigned ? ET::U1 : ET::I1;
+                }
+                else if (explicit_width) {
                     // __intN: exact width regardless of LLP64 'long' rules.
                     switch (width) {
                         case 1:  r.elem = is_unsigned ? ET::U2 : ET::I2; break;
@@ -2447,8 +2971,26 @@ private:
         }
     }
 
-    void skip_decl_specifiers(std::string_view src, size_t& pos) {
-        skip_ws(src, pos);
+    // stop_at_sal: callers that follow with sal.parse_all need SAL tokens
+    // left in place — _In_ & friends are decl-specifiers to every other
+    // caller (skip them), but the SAL parser must see them or the whole
+    // buffer-semantics family stays dead.
+    // Whitespace + comment skipper. MIDL-generated COM headers annotate
+    // nearly every token (`virtual /* [propget] */ HRESULT STDMETHODCALLTYPE
+    // Foo( /* [in] */ DWORD flags)`), and the decl-specifier/param readers
+    // stopped dead at '/', silently dropping the whole declaration.
+    void skip_ws_comments(std::string_view src, size_t& pos) {
+        for (;;) {
+            skip_ws(src, pos);
+            if (pos + 1 >= src.size() || src[pos] != '/') break;
+            if (src[pos + 1] == '*') { pos += 2; skip_block_comment(src, pos); }
+            else if (src[pos + 1] == '/') { while (pos < src.size() && src[pos] != '\n') ++pos; }
+            else break;
+        }
+    }
+
+    void skip_decl_specifiers(std::string_view src, size_t& pos, bool stop_at_sal = false) {
+        skip_ws_comments(src, pos);
         for (int guard = 0; guard < 50; ++guard) {
             if (pos >= src.size()) return;
             // Annotations are newline-separated: after consuming one
@@ -2458,7 +3000,7 @@ private:
             // but NOT its parenthesized arguments, which then poison the
             // following parameter slots (FormatMessageA/W lpBuffer/nSize/
             // Arguments all mangled into voids).
-            skip_ws(src, pos);
+            skip_ws_comments(src, pos);
             if (pos >= src.size()) return;
 
             if (src[pos] == '_' && pos + 1 < src.size() && std::isalpha((unsigned char)src[pos + 1])) {
@@ -2466,6 +3008,21 @@ private:
                 ++pos;
                 while (pos < src.size() && (std::isalnum((unsigned char)src[pos]) || src[pos] == '_')) ++pos;
                 std::string_view id = src.substr(id_start, pos - id_start);
+                if (stop_at_sal && SalParser::is_sal_annotation(id.substr(1))) {
+                    pos = id_start; // rewind: leave the token for parse_all
+                    return;
+                }
+                // Return-value annotations: recorded so the enricher can emit
+                // MustCheck / NullableResult. Without this the skipper ate
+                // them silently and MustCheck never fired for any API.
+                {
+                    auto stem = id.substr(1);
+                    if (!stem.empty() && stem.back() == '_') stem.remove_suffix(1);
+                    if (stem == "Must_inspect_result" || stem == "Check_return")
+                        g_decl_flags_sink |= FNF_MUST_CHECK;
+                    else if (stem == "Ret_maybenull" || stem == "Ret_opt")
+                        g_decl_flags_sink |= FNF_RET_MAYBENULL;
+                }
                 skip_ws(src, pos);
                 if (pos < src.size() && src[pos] == '(') {
                     skip_balanced(src, pos, '(', ')');
@@ -2478,7 +3035,27 @@ private:
                 if (pos < src.size() && src[pos] == '(') skip_balanced(src, pos, '(', ')');
             } else if (match_w(src, pos, "__declspec")) {
                 pos += 10; skip_ws(src, pos);
-                if (pos < src.size() && src[pos] == '(') skip_balanced(src, pos, '(', ')');
+                if (pos < src.size() && src[pos] == '(') {
+                    // __declspec(deprecated("reason")) — capture for the Obsolete attribute
+                    size_t dstart = pos + 1;
+                    skip_balanced(src, pos, '(', ')');
+                    size_t dend = (pos > dstart) ? pos - 1 : dstart;
+                    auto slice = src.substr(dstart, dend - dstart);
+                    auto dq = slice.find("deprecated");
+                    if (dq != std::string_view::npos) {
+                        g_decl_flags_sink |= FNF_DEPRECATED;
+                        auto ob = slice.find('(', dq);
+                        if (ob != std::string_view::npos) {
+                            auto cb = slice.find(')', ob);
+                            if (cb != std::string_view::npos && cb > ob + 1) {
+                                auto msg = slice.substr(ob + 1, cb - ob - 1);
+                                while (!msg.empty() && (msg.front() == ' ' || msg.front() == '"')) msg.remove_prefix(1);
+                                while (!msg.empty() && (msg.back() == ' ' || msg.back() == '"')) msg.remove_suffix(1);
+                                g_decl_msg_sink.assign(msg);
+                            }
+                        }
+                    }
+                }
             } else if (match_w(src, pos, "__annotation")) {
                 pos += 11; skip_ws(src, pos);
                 if (pos < src.size() && src[pos] == '(') skip_balanced(src, pos, '(', ')');
@@ -2503,6 +3080,13 @@ private:
                 size_t id_start = pos;
                 auto id = read_ident(src, pos);
                 if (id.empty()) return;
+                // Record inline/deprecation specifiers for the enricher.
+                if (id == "__forceinline") g_decl_flags_sink |= FNF_FORCEINLINE;
+                else if (id == "__inline" || id == "__inline__" || id == "FORCEINLINE" ||
+                         id == "WINFORCEINLINE" || id == "NTAPI_INLINE" || id == "__CRT_INLINE")
+                    g_decl_flags_sink |= FNF_INLINE;
+                else if (id == "DECLSPEC_DEPRECATED" || id == "DEPRECATED")
+                    g_decl_flags_sink |= FNF_DEPRECATED;
                 static const std::unordered_set<std::string> specifiers = {
                     "__forceinline","__inline","FORCEINLINE","WINFORCEINLINE","NTAPI_INLINE",
                     "DECLSPEC_NORETURN","DECLSPEC_ALIGN","DECLSPEC_ALLOCATOR","NTAPI",
@@ -2587,7 +3171,7 @@ private:
                 pos = id_start;
                 return;
             }
-            skip_ws(src, pos);
+            skip_ws_comments(src, pos);
         }
     }
 
@@ -2599,6 +3183,14 @@ private:
             else if (match_w(src, pos, "APIENTRY"))         { pos += 8; }
             else if (match_w(src, pos, "NTAPI"))            { pos += 5; }
             else if (match_w(src, pos, "CALLBACK"))         { pos += 8; }
+            else if (match_w(src, pos, "U_CALLCONV"))       { pos += 11; }
+            else if (match_w(src, pos, "U_EXPORT2"))        { pos += 9; }
+            else if (match_w(src, pos, "U_CDECL"))          { pos += 7; }
+            // oprghdlr.h: `#define EXPORT __cdecl` sits between the
+            // return type and the callback name (`typedef VOID EXPORT
+            // ACPI_OP_REGION_CALLBACK(...)`); without this the macro
+            // becomes the alias name and the real callback is swallowed.
+            else if (match_w(src, pos, "EXPORT"))           { pos += 6; }
             else if (match_w(src, pos, "STDMETHODCALLTYPE")){ pos += 18; }
             else if (match_w(src, pos, "__stdcall"))        { pos += 9; }
             else if (match_w(src, pos, "__cdecl"))          { pos += 7; }
@@ -2812,6 +3404,25 @@ private:
         // any header on earth can be pinned to any namespace by the caller.
         if (auto ov = st.ns_overrides.find(stem_lower); ov != st.ns_overrides.end())
             return ov->second;
+        // NuGet/extra include dirs: header stem becomes the leaf segment
+        // under the dir's registered namespace root (no table entry needed).
+        if (!st.extra_include_ns.empty())
+        {
+            namespace efs = std::filesystem;
+            efs::path p = efs::path(filepath).lexically_normal();
+            std::string fp = p.generic_string();
+            for (auto const& [dir, root] : st.extra_include_ns)
+            {
+                std::string d = efs::path(dir).lexically_normal().generic_string();
+                if (fp.size() > d.size() && fp.compare(0, d.size(), d) == 0 &&
+                    (fp[d.size()] == '/' ))
+                {
+                    std::string leaf;
+                    for (char c : stem) leaf += char(std::toupper((unsigned char)c));
+                    return root + "." + leaf;
+                }
+            }
+        }
         // Unmapped headers follow the DIRECTORY they came from: km/ headers
         // are kernel-mode (Windows.Wdk.*), everything else (um/, shared/,
         // winrt/, extra -include_dir) is user-mode (Windows.Win32.*). The

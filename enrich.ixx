@@ -5,6 +5,11 @@ module;
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <map>
+#include <set>
+#include <mutex>
+#include <cstdio>
+#include <cstdlib>
 #include <unordered_map>
 #include <unordered_set>
 #include <algorithm>
@@ -18,20 +23,46 @@ import winversec.attributes;
 
 export namespace wv {
 
+// Env-gated per-attribute emission trace (WINVERSE_ATTRTRACE=1).
+struct AttrTrace {
+    std::mutex m;
+    std::map<std::string, uint64_t> counts;
+};
+inline AttrTrace& attr_trace() { static AttrTrace t; return t; }
+inline bool attr_trace_enabled()
+{
+    static const bool on = std::getenv("WINVERSE_ATTRTRACE") != nullptr;
+    return on;
+}
+
 class Enricher {
 public:
     State& st;
     explicit Enricher(State& s) : st(s) {}
     void run();
     void run_parallel(size_t num_threads);
+    // Target SDK version (e.g. "10.0.26100") — stamped onto every API as
+    // PlatformSupported so projections know the minimum platform build.
+    void set_sdk_version(std::string v) { sdk_version_ = std::move(v); }
 
 private:
     std::unordered_map<std::string, attr::HandleKind> handle_map_;
     std::unordered_map<std::string, std::string> dll_map_;
+    std::string sdk_version_ = "10.0.26100";
 
     void init_handle_map();
     void init_dll_map();
+    void materialize_ioctl_consts();
+    void materialize_irp_mj_consts();
+    void init_callback_names();
+    std::set<std::string, std::less<>> callback_names_;
     void enrich_type(Item& item);
+    // Wires every remaining attribute the pipeline historically left
+    // defined-only (architecture, pack, pointer size, close functions,
+    // must-check, inline, obsolete, buffer length/type, com method/property/
+    // event, guid, type forward, primitive type, constant, partition,
+    // platform, contract, feature, variant, driver attributes, ...).
+    void enrich_extra(Item& item);
     void detect_enum_flags(TDef& td);
     void detect_ioctl_constants(TDef& td);
     attr::FuncCategory categorize_by_header(const std::string& header);
@@ -40,10 +71,79 @@ private:
     size_t aw_stripped_ = 0;
 };
 
+// Materialize evaluated CTL_CODE defines into single-member enum items so
+// the normal enum path (detect_ioctl_constants) emits IoctlCode /
+// IoctlBuffering for them.
+inline void Enricher::materialize_ioctl_consts()
+{
+    std::set<std::string, std::less<>> seen;
+    for (auto const& ic : st.ioctl_consts)
+    {
+        if (!seen.insert(ic.name).second) continue;
+        TDef td;
+        td.kind = Kind::Enum;
+        td.ns = "Windows.Win32.System.IO";
+        td.name = ic.name;
+        td.attr = TA::Pub;
+        td.source_header = "shared/ioctl.h";
+        FDef f;
+        f.name = ic.name;
+        f.attr = FA::Pub | FA::Literal | FA::InitOnly;
+        f.type = ET::U4;
+        f.def.type = ET::U4;
+        f.def.v = ic.value;
+        td.fields.push_back(std::move(f));
+        st.items.push_back({ std::move(td), Ar::All, "shared/ioctl.h" });
+        st.nss.insert("Windows.Win32.System.IO");
+    }
+}
+
+// IRP major-function codes are `#define IRP_MJ_CREATE 0x00` in wdm.h —
+// never enum members — so materialize them as single-member enums; the
+// existing IRP_MJ_ enum scan then emits IrpMajorFunction rows carrying
+// the real code value.
+inline void Enricher::materialize_irp_mj_consts()
+{
+    std::set<std::string, std::less<>> seen;
+    for (auto const& ic : st.irp_mj_consts)
+    {
+        if (!seen.insert(ic.name).second) continue;
+        TDef td;
+        td.kind = Kind::Enum;
+        td.ns = "Windows.Wdk.Wdm";
+        td.name = ic.name;
+        td.attr = TA::Pub;
+        td.source_header = "km/wdm.h";
+        FDef f;
+        f.name = ic.name;
+        f.attr = FA::Pub | FA::Literal | FA::InitOnly;
+        f.type = ET::U4;
+        f.def.type = ET::U4;
+        f.def.v = ic.value;
+        td.fields.push_back(std::move(f));
+        st.items.push_back({ std::move(td), Ar::All, "km/wdm.h" });
+        st.nss.insert("Windows.Wdk.Wdm");
+    }
+}
+
+// Callback typedef names (Kind::Delegate / is_callback). A param typed
+// with one of these plus an _Opt_ SAL marker is an optional callback —
+// the CallbackOptional attribute, which previously required an inline
+// fnptr syntax the SDK never uses on parameters.
+inline void Enricher::init_callback_names()
+{
+    for (auto const& item : st.items)
+        if (item.def.kind == Kind::Delegate || item.def.is_callback)
+            callback_names_.insert(item.def.name);
+}
+
 inline void Enricher::run()
 {
     init_handle_map();
     init_dll_map();
+    init_callback_names();
+    materialize_ioctl_consts();
+    materialize_irp_mj_consts();
     for (auto& item : st.items)
     {
         enrich_type(item);
@@ -55,6 +155,9 @@ inline void Enricher::run_parallel(size_t num_threads)
 {
     init_handle_map();
     init_dll_map();
+    init_callback_names();
+    materialize_ioctl_consts();
+    materialize_irp_mj_consts();
     if (st.items.empty() || num_threads <= 1)
     {
         run();
@@ -76,6 +179,14 @@ inline void Enricher::run_parallel(size_t num_threads)
     }
     for (auto& th : threads) th.join();
     resolve_aw_suffixes();
+    if (attr_trace_enabled())
+    {
+        auto& tr = attr_trace();
+        std::lock_guard<std::mutex> lock(tr.m);
+        std::fprintf(stderr, "[attr-trace] per-kind emission counts:\n");
+        for (auto const& [name, n] : tr.counts)
+            std::fprintf(stderr, "[attr-trace] %-24s %llu\n", name.c_str(), (unsigned long long)n);
+    }
 }
 
 inline void Enricher::init_handle_map()
@@ -2365,7 +2476,9 @@ inline void Enricher::enrich_type(Item& item)
                     break;
                 }
             }
-            if (derives_iunknown)
+            // MIDL_INTERFACE("...") declares a COM interface even when the
+            // inheritance clause is not spelled out — a GUID is conclusive.
+            if (derives_iunknown || !td.com_iid.empty())
             {
                 td.is_com_interface = true;
                 td.attributes.push_back(attr::make_com_interface({
@@ -2398,6 +2511,26 @@ inline void Enricher::enrich_type(Item& item)
                         .entry_point = td.name,
                     }));
                     td.attributes.push_back(attr::make_dll_import(it->second));
+                    td.attributes.push_back(attr::make_export_function(td.name));
+                }
+                else if (!td.import_library.empty())
+                {
+                    // Resolved by an earlier pass; keep it.
+                    if (td.entry_point.empty()) td.entry_point = td.name;
+                }
+                else if (auto nit = st.dll_imports.find(td.name); nit != st.dll_imports.end())
+                {
+                    // Flat-C export discovered from a NuGet import lib
+                    // (scanned by the CLI); dll name read from the import
+                    // descriptor, consulted after the built-in table.
+                    td.import_library = nit->second;
+                    td.entry_point = td.name;
+                    td.attributes.push_back(attr::make_import_library({
+                        .dll = nit->second,
+                        .entry_point = td.name,
+                    }));
+                    td.attributes.push_back(attr::make_dll_import(nit->second));
+                    td.attributes.push_back(attr::make_export_function(td.name));
                 }
 
                 auto cc = CC::Def;
@@ -2578,6 +2711,17 @@ inline void Enricher::enrich_type(Item& item)
         {
             td.attributes.push_back(attr::make_function_category(cat));
         }
+
+        enrich_extra(item);
+
+        // WINVERSE_ATTRTRACE=1: count every emitted attribute per kind for
+        // coverage diagnostics (printed after the enrich pass).
+        if (attr_trace_enabled())
+        {
+            auto& tr = attr_trace();
+            std::lock_guard<std::mutex> lock(tr.m);
+            for (auto& a : td.attributes) ++tr.counts[a.name];
+        }
     }
 
 inline void Enricher::detect_enum_flags(TDef& td)
@@ -2643,6 +2787,56 @@ inline void Enricher::detect_enum_flags(TDef& td)
             td.is_enum_flags = true;
             td.attributes.push_back(attr::make_flags());
         }
+
+        // Shape classification runs independent of the [Flags] gate above:
+        // a pure bitmask (>= 2 single-bit members, none combined) is
+        // EnumPowerOf2 even without a 0 member. The old entry gate required
+        // a combined member (multi_bit_count >= 1) while the power-of-2 test
+        // required multi_bit_count == 0 — mutually exclusive, so
+        // EnumPowerOf2 could never fire for any enum in the SDK.
+        if (single_bit_count >= 2)
+        {
+            // Classify member shapes for the companion attributes:
+            //  - power-of-2: every non-zero member is a single bit
+            //  - combination: at least one multi-bit member whose bits all
+            //    decompose into declared single-bit members
+            auto field_val = [](FDef const& f, uint64_t& out) -> bool {
+                switch (f.def.type)
+                {
+                    case ET::I4: out = (uint64_t)(int64_t)std::get<int32_t>(f.def.v); return true;
+                    case ET::U4: out = std::get<uint32_t>(f.def.v); return true;
+                    case ET::I8: out = (uint64_t)std::get<int64_t>(f.def.v); return true;
+                    case ET::U8: out = std::get<uint64_t>(f.def.v); return true;
+                    case ET::I1: out = (uint64_t)(int64_t)std::get<int8_t>(f.def.v); return true;
+                    case ET::U1: out = std::get<uint8_t>(f.def.v); return true;
+                    case ET::I2: out = (uint64_t)(int64_t)std::get<int16_t>(f.def.v); return true;
+                    case ET::U2: out = std::get<uint16_t>(f.def.v); return true;
+                    default: return false;
+                }
+            };
+            uint64_t bit_mask = 0;
+            int single = 0, combos = 0, bad_combos = 0;
+            for (auto& f : td.fields)
+            {
+                uint64_t v = 0;
+                if (!field_val(f, v) || v == 0) continue;
+                if ((v & (v - 1)) == 0) { bit_mask |= v; ++single; }
+            }
+            for (auto& f : td.fields)
+            {
+                uint64_t v = 0;
+                if (!field_val(f, v) || v == 0) continue;
+                if ((v & (v - 1)) != 0)
+                {
+                    if ((v & ~bit_mask) == 0) ++combos; else ++bad_combos;
+                }
+            }
+            // power-of-2: the enum is a pure bitmask (no combined members)
+            if (single_bit_count >= 2 && multi_bit_count == 0)
+                td.attributes.push_back(attr::make_enum_power_of2());
+            if (combos > 0)
+                td.attributes.push_back(attr::make_enum_combination());
+        }
     }
 
 inline void Enricher::detect_ioctl_constants(TDef& td)
@@ -2652,7 +2846,10 @@ inline void Enricher::detect_ioctl_constants(TDef& td)
         {
             for (auto& f : td.fields)
             {
-                if (f.name.size() < 7 || f.name.substr(0, 7) != "IOCTL_") continue;
+                // NB: "IOCTL_" is 6 chars — an earlier version compared
+                // substr(0, 7) against it, which can never match, so this
+                // detector emitted nothing for the entire SDK.
+                if (!(f.name.rfind("IOCTL_", 0) == 0 || f.name.rfind("FSCTL_", 0) == 0)) continue;
                 uint64_t val = 0;
                 bool got_val = false;
                 if (f.def.type == ET::U4) { val = std::get<uint32_t>(f.def.v); got_val = true; }
@@ -2753,6 +2950,298 @@ inline void Enricher::resolve_aw_suffixes()
                 name = base;
                 ++aw_stripped_;
             }
+            else
+            {
+                // A surviving suffix means the opposite-suffix sibling
+                // exists: a genuine Unicode/Ansi variant pair.
+                item.def.attributes.push_back(attr::make_variant(
+                    last == 'W' ? "Unicode" : "Ansi"));
+            }
+        }
+    }
+
+    //
+    // enrich_extra — the remaining attribute surface. Every attribute the
+    // factory layer defines gets an emission here, driven by data the
+    // parser/enricher already has (SAL, decl specifiers, header paths,
+    // architecture, handle/dll maps, enum analysis, naming conventions).
+    //
+    inline void Enricher::enrich_extra(Item& item)
+    {
+        auto& td = item.def;
+
+        // SDK partition + kernel/UMDK detection
+        bool is_km = td.source_header.find("/km/") != std::string::npos ||
+                     td.source_header.find("\\km\\") != std::string::npos;
+        bool is_um = td.source_header.find("/um/") != std::string::npos ||
+                     td.source_header.find("\\um\\") != std::string::npos;
+        bool is_wasdk = td.source_header.find("windowsappsdk") != std::string::npos ||
+                        td.source_header.find("WindowsAppSDK") != std::string::npos;
+        td.attributes.push_back(attr::make_partition(is_km ? "km" : (is_um ? "um" : "shared")));
+
+        // Platform checks + availability on the target SDK build.
+        td.attributes.push_back(attr::make_platform(0)); // 0 = Windows (universal)
+        if (!sdk_version_.empty())
+            td.attributes.push_back(attr::make_platform_supported(sdk_version_));
+
+        // WindowsAppSDK-derived headers carry the App-SDK contract/feature.
+        if (is_wasdk)
+        {
+            td.attributes.push_back(attr::make_contract("WindowsAppSdk", 0));
+            td.attributes.push_back(attr::make_feature("WindowsAppSdk"));
+        }
+
+        // Architecture / struct layout extras
+        if (item.arch != Ar::All && item.arch != Ar::None)
+            td.attributes.push_back(attr::make_architecture(item.arch));
+
+        bool is_record = td.kind == Kind::Struct || td.kind == Kind::Union;
+        if (is_record && td.pack != 0)
+            td.attributes.push_back(attr::make_pack(td.pack));
+
+        if (is_record)
+        {
+            bool has_ptr = false, anon = false;
+            for (auto& f : td.fields)
+            {
+                if (f.ref.ptr > 0 || f.ref.fnptr || f.ref.elem == ET::Ptr) has_ptr = true;
+                // An anonymous nested record projects as a field with no name.
+                if (f.name.empty()) anon = true;
+            }
+            if (anon) td.attributes.push_back(attr::make_anonymous_struct());
+            if (has_ptr)
+            {
+                uint32_t psize = (item.arch == Ar::X86) ? 4u : 8u;
+                td.attributes.push_back(attr::make_pointer_size(psize));
+            }
+        }
+
+        // Handles: close function + access
+        if (td.kind == Kind::Class || td.kind == Kind::Struct)
+        {
+            auto ht = handle_map_.find(td.name);
+            if (ht != handle_map_.end())
+            {
+                const char* close_fn = "CloseHandle";
+                switch (ht->second)
+                {
+                    case attr::HandleKind::Registry: close_fn = "RegCloseKey"; break;
+                    case attr::HandleKind::Service:
+                    case attr::HandleKind::SCManager: close_fn = "CloseServiceHandle"; break;
+                    case attr::HandleKind::Find: close_fn = "FindClose"; break;
+                    case attr::HandleKind::ChangeNotification: close_fn = "FindCloseChangeNotification"; break;
+                    case attr::HandleKind::Memory:
+                    case attr::HandleKind::FileMapping: close_fn = "UnmapViewOfFile"; break;
+                    case attr::HandleKind::Socket: close_fn = "closesocket"; break;
+                    case attr::HandleKind::DC: close_fn = "DeleteDC"; break;
+                    case attr::HandleKind::Bitmap:
+                    case attr::HandleKind::Brush:
+                    case attr::HandleKind::Font:
+                    case attr::HandleKind::Pen:
+                    case attr::HandleKind::Region: close_fn = "DeleteObject"; break;
+                    case attr::HandleKind::Icon: close_fn = "DestroyIcon"; break;
+                    case attr::HandleKind::Cursor: close_fn = "DestroyCursor"; break;
+                    case attr::HandleKind::Menu: close_fn = "DestroyMenu"; break;
+                    case attr::HandleKind::Window: close_fn = "DestroyWindow"; break;
+                    case attr::HandleKind::Clipboard: close_fn = "CloseClipboard"; break;
+                    case attr::HandleKind::Desktop: close_fn = "CloseDesktop"; break;
+                    case attr::HandleKind::WindowStation: close_fn = "CloseWindowStation"; break;
+                    case attr::HandleKind::Monitor: close_fn = "DestroyMonitor"; break;
+                    default: break;
+                }
+                td.attributes.push_back(attr::make_close_function(close_fn));
+                td.attributes.push_back(attr::make_handle_access(3)); // Read|Write -> All
+            }
+        }
+
+        // Simple typedefs: type_forward / primitive_type
+        if ((td.kind == Kind::Class || td.kind == Kind::Struct) &&
+            (td.alias_elem != ET::Void || !td.alias_ref.name.empty()))
+        {
+            // Primitive aliases carry a fundamental element type; named
+            // targets (typedef HANDLE HLOCAL, typedef GUID CLSID) forward
+            // to the named type instead.
+            bool named_target = !td.alias_ref.name.empty();
+            bool primitive = td.alias_elem != ET::Void &&
+                             td.alias_elem != ET::Class &&
+                             td.alias_elem != ET::Ptr &&
+                             td.alias_elem != ET::FnPtr;
+            if (primitive)
+            {
+                using PV = attr::PrimitiveTypeVal;
+                PV pv;
+                switch (td.alias_elem)
+                {
+                    case ET::Bool: pv = PV::Bool; break;
+                    case ET::I1: pv = PV::I1; break;
+                    case ET::U1: pv = PV::U1; break;
+                    case ET::I2: pv = PV::I2; break;
+                    case ET::U2: pv = PV::U2; break;
+                    case ET::I4: pv = PV::I4; break;
+                    case ET::U4: pv = PV::U4; break;
+                    case ET::I8: pv = PV::I8; break;
+                    case ET::U8: pv = PV::U8; break;
+                    case ET::R4: pv = PV::R4; break;
+                    case ET::R8: pv = PV::R8; break;
+                    case ET::Char: pv = PV::Char; break;
+                    case ET::String: pv = PV::String; break;
+                    default: pv = PV::Void; break;
+                }
+                td.attributes.push_back(attr::make_primitive_type(pv));
+            }
+            else if (named_target)
+            {
+                td.attributes.push_back(attr::make_type_forward(
+                    td.alias_ref.ns.empty() ? td.alias_ref.name
+                                            : td.alias_ref.ns + "." + td.alias_ref.name));
+            }
+        }
+
+        // Enums with literal members ARE the constant source
+        if (td.kind == Kind::Enum)
+        {
+            for (auto& f : td.fields)
+            {
+                if ((uint16_t)f.attr & (uint16_t)FA::Literal)
+                {
+                    td.attributes.push_back(attr::make_constant());
+                    break; // one marker per enum item is enough
+                }
+            }
+            // IRP major function codes
+            for (auto& f : td.fields)
+            {
+                if (f.name.starts_with("IRP_MJ_"))
+                {
+                    uint64_t v = 0;
+                    if (f.def.type == ET::U4) v = std::get<uint32_t>(f.def.v);
+                    else if (f.def.type == ET::I4) v = (uint64_t)(int64_t)std::get<int32_t>(f.def.v);
+                    td.attributes.push_back(attr::make_irp_mj((uint32_t)v));
+                }
+            }
+        }
+
+        // COM interfaces: guid + per-method vtable rows + property/event
+        // Every Kind::Iface is a COM interface by construction (the parser
+        // only produces it from MIDL_INTERFACE/DECLARE_INTERFACE), so do not
+        // require the is_com_interface flag here: an interface that derives
+        // from a named base (not literally IUnknown/IDispatch) and carries no
+        // IID would otherwise get no vtable rows at all.
+        if (td.kind == Kind::Iface)
+        {
+            if (!td.com_iid.empty())
+                td.attributes.push_back(attr::make_guid(td.com_iid));
+            for (size_t mi = 0; mi < td.meths.size(); ++mi)
+            {
+                td.attributes.push_back(attr::make_com_method((uint32_t)mi));
+                auto const& nm = td.meths[mi].name;
+                // get_X at slot i paired with put_X/set_X at slot i+1
+                if (nm.starts_with("get_") && mi + 1 < td.meths.size())
+                {
+                    auto const& nx = td.meths[mi + 1].name;
+                    if (nx == "put_" + nm.substr(4) || nx == "set_" + nm.substr(4))
+                        td.attributes.push_back(
+                            attr::make_com_property((uint32_t)mi, (uint32_t)(mi + 1)));
+                }
+                // add_X at slot i paired with remove_X at slot i+1 = event
+                if (nm.starts_with("add_") && mi + 1 < td.meths.size() &&
+                    td.meths[mi + 1].name == "remove_" + nm.substr(4))
+                    td.attributes.push_back(attr::make_com_event(td.com_iid));
+            }
+        }
+        if (td.kind == Kind::Class && !td.com_iid.empty())
+        {
+            td.attributes.push_back(attr::make_com_coclass({ td.com_iid, "" }));
+            td.attributes.push_back(attr::make_guid(td.com_iid));
+        }
+        else if (!td.com_iid.empty() && td.kind != Kind::Iface)
+        {
+            td.attributes.push_back(attr::make_guid(td.com_iid));
+        }
+
+        // Kernel driver attributes
+        if (is_km)
+        {
+            bool is_wdf = td.name.starts_with("Wdf") || td.name.starts_with("WDF");
+            td.attributes.push_back(attr::make_driver_type(
+                is_wdf ? attr::DriverTypeVal::KMDF : attr::DriverTypeVal::WDM));
+            if (is_wdf)
+                td.attributes.push_back(attr::make_wdf_object((uint32_t)attr::DriverTypeVal::KMDF));
+            if (td.kind == Kind::Func && td.name.find("Dispatch") != std::string::npos)
+                td.attributes.push_back(attr::make_driver_dispatch(0, 0));
+            // Dispatch-class callback typedefs — the SDK labels them with
+            // _Function_class_(DRIVER_DISPATCH); the typedef name alone
+            // often carries no hint.
+            if (td.kind == Kind::Delegate && td.fn_class.starts_with("DRIVER_DISPATCH"))
+                td.attributes.push_back(attr::make_driver_dispatch(0, 0));
+        }
+        if (td.name.find("POWER_STATE") != std::string::npos)
+            td.attributes.push_back(attr::make_power_state(0));
+        if (td.name.find("PNP") != std::string::npos || td.name.find("PnP") != std::string::npos)
+            td.attributes.push_back(attr::make_pnp_state(0));
+
+        // Functions: inline / obsolete / must-check / win32-error /
+        // nothrow / nullable-result + per-param buffer/string extras
+        if (td.kind == Kind::Func)
+        {
+            if (td.fn_flags & FNF_FORCEINLINE)
+                td.attributes.push_back(attr::make_inline_function(attr::InlineKind::ForceInline));
+            else if (td.fn_flags & FNF_INLINE)
+                td.attributes.push_back(attr::make_inline_function(attr::InlineKind::Normal));
+
+            if (td.fn_flags & FNF_DEPRECATED)
+                td.attributes.push_back(attr::make_obsolete(td.deprecation_msg));
+
+            bool must_check = (td.fn_flags & FNF_RET_MAYBENULL) != 0 ||
+                               (td.fn_flags & FNF_MUST_CHECK) != 0;
+            bool ret_is_ptr = false;
+            for (auto& m : td.meths)
+            {
+                if (m.ret == ET::Ptr || m.ret == ET::FnPtr) ret_is_ptr = true;
+                if (handle_map_.count(m.ret_r.name)) ret_is_ptr = true;
+                if (m.ret == ET::I4 && m.ret_r.name == "WIN32_ERROR")
+                    td.attributes.push_back(attr::make_win32_error());
+            }
+            for (auto& m : td.meths)
+            {
+                for (size_t pi = 0; pi < m.params.size() && pi < m.pt.size(); ++pi)
+                {
+                    auto& pd = m.params[pi];
+                    auto& pt = m.pt[pi];
+                    if (pd.sal_flags & SF_CHECK_RETURN) must_check = true;
+
+                    if (pd.sal_buffer_info != 0)
+                    {
+                        if (!pd.sal_count_param.empty())
+                            td.attributes.push_back(attr::make_buffer_length(pd.sal_count_param));
+                        else if (!pd.sal_count_expression.empty())
+                            td.attributes.push_back(attr::make_buffer_length(pd.sal_count_expression));
+                        uint32_t bk = pd.sal_buffer_info & 0xFF;
+                        if (bk >= 4) // string-typed buffer kinds
+                            td.attributes.push_back(attr::make_buffer_null(1));
+                        else if (pd.sal_flags & SF_NULL_TERM)
+                            td.attributes.push_back(attr::make_buffer_null(1));
+                        if (!pt.name.empty())
+                            td.attributes.push_back(attr::make_buffer_type(pt.name));
+                    }
+                    // char-typed buffers with a SAL count expression carry
+                    // the static upper bound for marshaling.
+                    bool is_char_param = (pt.elem == ET::Char) ||
+                        pt.name.find("CHAR") != std::string::npos ||
+                        pt.name.find("char") != std::string::npos;
+                    if (pt.ptr > 0 && is_char_param && !pd.sal_count_expression.empty())
+                        td.attributes.push_back(attr::make_string_max_length(pd.sal_count_expression));
+                    // Optional callback parameters: an inline fnptr or a
+                    // param typed with a callback typedef, plus _Opt_ SAL.
+                    if ((pt.fnptr || callback_names_.count(pt.name)) &&
+                        ((uint16_t)pd.attr & (uint16_t)PA::Opt))
+                        td.attributes.push_back(attr::make_callback_optional());
+                }
+            }
+            if (must_check) td.attributes.push_back(attr::make_must_check());
+            // Kernel-mode functions never throw across the ABI boundary.
+            if (is_km) td.attributes.push_back(attr::make_no_throw());
+            if (ret_is_ptr) td.attributes.push_back(attr::make_nullable_result());
         }
     }
 
