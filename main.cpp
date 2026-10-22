@@ -521,6 +521,16 @@ int main(int argc, char* argv[]) {
             if (it.def.kind == wv::Kind::Iface) s += 3;
             return s;
         };
+        // KMDF vs UMDF flavor tie-break: both WDF trees declare the same
+        // Wdf* names into the same namespace, so equal-score duplicates
+        // would otherwise let the parallel arrival order decide which
+        // flavor survives (run-to-run nondeterminism). The kernel flavor
+        // (Include\wdf\kmdf\) wins every tie.
+        auto is_kmdf_flavor = [](wv::Item const& it) {
+            auto const& h = it.def.source_header;
+            return h.find("\\wdf\\kmdf\\") != std::string::npos ||
+                   h.find("/wdf/kmdf/") != std::string::npos;
+        };
         std::unordered_map<std::string, size_t> seen_idx;
         seen_idx.reserve(state.items.size());
         std::vector<wv::Item> unique;
@@ -550,8 +560,10 @@ int main(int argc, char* argv[]) {
                     d.com_iid = w.com_iid;
                     d.is_com_interface = true;
                 }
-                if (item_score(item) > item_score(unique[it->second])) {
-                    unique[it->second] = std::move(item); // definition beats declaration
+                if (item_score(item) > item_score(unique[it->second]) ||
+                    (item_score(item) == item_score(unique[it->second]) &&
+                     is_kmdf_flavor(item) && !is_kmdf_flavor(unique[it->second]))) {
+                    unique[it->second] = std::move(item); // definition beats declaration; kernel flavor beats user-mode
                 }
             }
         }

@@ -30,15 +30,15 @@ public:
         size_t total_funcs=0, resolved_funcs=0;
         size_t total_consts=0, resolved_consts=0;
         size_t unresolved_refs=0;
+        std::vector<std::string> unresolved_names; // "host.ns.Type -> missing.ns.Iface"
         std::vector<std::string> missing;
     };
 
     Report run(const std::filesystem::path& sdk_root, const std::string& version_dir) {
         Report r;
         auto base = sdk_root / "Include" / version_dir;
-        for (auto& d : {"um","km","shared"}) {
-            auto p = base / d;
-            if (!std::filesystem::exists(p)) continue;
+        auto count_dir = [&](const std::filesystem::path& p) {
+            if (!std::filesystem::exists(p)) return;
             for (auto& e : std::filesystem::recursive_directory_iterator(p)) {
                 if (e.is_regular_file()) {
                     auto ext = e.path().extension().string();
@@ -63,18 +63,30 @@ public:
                     }
                 }
             }
-        }
+        };
+        for (auto& d : {"um","km","shared"}) count_dir(base / d);
+        // The WDF framework trees (Include\wdf\{kmdf,umdf}\<ver>) are parsed
+        // but live outside the versioned Include/<ver> tree — count the dirs
+        // parse_sdk actually scanned or the report undercounts headers.
+        for (auto& wd : st.wdf_dirs) count_dir(wd);
         std::unordered_set<std::string> res;
-        for (auto& it : st.items) {
+        std::unordered_set<std::string> res_names; // name-only index: interface refs
+        for (auto& it : st.items) {              // often carry an empty ns
             ++r.total_types;
-            if (!it.def.name.empty()) res.insert(it.def.ns+"."+it.def.name);
+            if (!it.def.name.empty()) {
+                res.insert(it.def.ns+"."+it.def.name);
+                res_names.insert(it.def.name);
+            }
             ++r.resolved_types;
             for (auto& m : it.def.meths) { ++r.total_funcs; ++r.resolved_funcs; }
             for (auto& f : it.def.fields) { if (!f.def.empty()) { ++r.total_consts; ++r.resolved_consts; } }
         }
         for (auto& it : st.items)
             for (auto& i : it.def.ifaces)
-                if (res.count(i.ns+"."+i.name)==0) ++r.unresolved_refs;
+                if (res.count(i.ns+"."+i.name)==0 && res_names.count(i.name)==0) {
+                    ++r.unresolved_refs;
+                    r.unresolved_names.push_back(it.def.ns + "." + it.def.name + " -> " + i.ns + "." + i.name);
+                }
         return r;
     }
 
@@ -90,6 +102,8 @@ public:
                   << "Consts:  " << r.resolved_consts << "/" << r.total_consts
                   << " (" << pct(r.resolved_consts,r.total_consts) << "%)\n"
                   << "Unresolved: " << r.unresolved_refs << "\n";
+        for (auto const& u : r.unresolved_names)
+            std::cout << "    ? " << u << "\n";
     }
 
     bool write_html(const Report& r, const std::string& path) {
@@ -131,6 +145,8 @@ public:
         bar("Functions", r.resolved_funcs, r.total_funcs);
         bar("Constants", r.resolved_consts, r.total_consts);
         f << "<h2>Unresolved References: " << r.unresolved_refs << "</h2>";
+        for (auto const& u : r.unresolved_names)
+            f << "<div style='color:#ffa500;font-size:12px'>" << esc(u) << "</div>";
 
         // Per-namespace API detail: every Win32 / WDK / WASDK namespace
         // with its functions (signature + dll), types (kind + members),

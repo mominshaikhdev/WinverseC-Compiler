@@ -109,6 +109,48 @@ public:
         if (std::filesystem::exists(shared)) collect_files(shared, files);
         if (!st.drivers_only && std::filesystem::exists(winrt)) collect_files(winrt, files);
 
+        // KMDF/UMDF framework headers do NOT live under Include/<ver>/{um,
+        // km, shared} — the WDK ships them at Include/wdf/kmdf/<ver>/ and
+        // Include/wdf/umdf/<ver>/, outside the versioned tree, so the walks
+        // above never saw them and the entire WDF framework (WdfDeviceCreate
+        // & co.) was absent from the winmd. Scan the newest installed
+        // version of each flavor and register it as an include path so the
+        // headers' <wdf*.h> includes resolve.
+        if (st.include_drivers)
+        {
+            auto latest_version_dir = [](const std::filesystem::path& root) -> std::filesystem::path {
+                std::error_code ec;
+                if (!std::filesystem::is_directory(root, ec)) return {};
+                std::filesystem::path best;
+                std::vector<int> best_v;
+                for (auto& e : std::filesystem::directory_iterator(root, ec)) {
+                    if (!e.is_directory()) continue;
+                    auto name = e.path().filename().string();
+                    if (name.empty() || !std::isdigit((unsigned char)name[0])) continue;
+                    std::vector<int> v;
+                    int cur = 0;
+                    bool in_num = false;
+                    for (char c : name) {
+                        if (std::isdigit((unsigned char)c)) { cur = cur * 10 + (c - '0'); in_num = true; }
+                        else if (c == '.' && in_num) { v.push_back(cur); cur = 0; in_num = false; }
+                        else break;
+                    }
+                    if (in_num) v.push_back(cur);
+                    if (v.empty()) continue;
+                    // numeric vector compare: [1,9] < [1,15] (string sort would get this wrong)
+                    if (best.empty() || v > best_v) { best = e.path(); best_v = std::move(v); }
+                }
+                return best;
+            };
+            for (const char* flavor : { "kmdf", "umdf" }) {
+                auto d = latest_version_dir(sdk_root / "Include" / "wdf" / flavor);
+                if (d.empty()) continue;
+                sal_init_pp.add_include_path(d);
+                collect_files(d, files);
+                st.wdf_dirs.push_back(d);
+            }
+        }
+
         // Extra include dirs (-include_dir, repeatable): scanned recursively
         // for headers the SDK does not already provide (e.g. the Windows App
         // SDK NuGet package's MddBootstrap.h). Dedup is SDK-first by file
@@ -3371,6 +3413,42 @@ private:
             {"ndis","Windows.Wdk.Ndis"},
             {"storport","Windows.Wdk.Storport"},
             {"wdf","Windows.Wdk.Wdf"},
+            // KMDF framework headers (Include\wdf\kmdf\<ver>) — shipped
+            // outside km/, so these stems were never exercised until the
+            // WDF trees became scannable.
+            {"wdfassert","Windows.Wdk.WdfAssert"},
+            {"wdfbugcodes","Windows.Wdk.WdfBugCodes"},
+            {"wdfcommonbuffer","Windows.Wdk.WdfCommonBuffer"},
+            {"wdfcompaniontarget","Windows.Wdk.WdfCompanionTarget"},
+            {"wdfcontrol","Windows.Wdk.WdfControl"},
+            {"wdfcore","Windows.Wdk.WdfCore"},
+            {"wdfdmaenabler","Windows.Wdk.WdfDmaEnabler"},
+            {"wdfdmatransaction","Windows.Wdk.WdfDmaTransaction"},
+            {"wdfdpc","Windows.Wdk.WdfDpc"},
+            {"wdffdo","Windows.Wdk.WdfFdo"},
+            {"wdffuncenum","Windows.Wdk.WdfFuncEnum"},
+            {"wdfglobals","Windows.Wdk.WdfGlobals"},
+            {"wdfhwaccess","Windows.Wdk.WdfHwAccess"},
+            {"wdfinstaller","Windows.Wdk.WdfInstaller"},
+            {"wdfiotarget","Windows.Wdk.WdfIoTarget"},
+            {"wdfmemory","Windows.Wdk.WdfMemory"},
+            {"wdfminiport","Windows.Wdk.WdfMiniport"},
+            {"wdfpdo","Windows.Wdk.WdfPdo"},
+            {"wdfpool","Windows.Wdk.WdfPool"},
+            {"wdfqueryinterface","Windows.Wdk.WdfQueryInterface"},
+            {"wdfresource","Windows.Wdk.WdfResource"},
+            {"wdfroletypes","Windows.Wdk.WdfRoleTypes"},
+            {"wdfstatus","Windows.Wdk.WdfStatus"},
+            {"wdftraceenums","Windows.Wdk.WdfTraceEnums"},
+            {"wdftypes","Windows.Wdk.WdfTypes"},
+            {"wdfusb","Windows.Wdk.WdfUsb"},
+            {"wdfverifier","Windows.Wdk.WdfVerifier"},
+            {"wdfwmi","Windows.Wdk.WdfWmi"},
+            // UMDF-only headers (no KMDF counterpart) — same Windows.Wdk.Wdf*
+            // family as the rest of the framework.
+            {"wdfcompanion","Windows.Wdk.WdfCompanion"},
+            {"wdftriage","Windows.Wdk.WdfTriage"},
+            {"wudfwdm","Windows.Wdk.WudfWdm"},
             {"wdfdmadefault","Windows.Wdk.WdfDmaDefault"},
             {"wdfminorfunctions","Windows.Wdk.WdfMinorFunctions"},
             {"umdf","Windows.Wdk.Umdf"},
@@ -3417,21 +3495,80 @@ private:
                 if (fp.size() > d.size() && fp.compare(0, d.size(), d) == 0 &&
                     (fp[d.size()] == '/' ))
                 {
+                    // WASDK headers are named after the API they expose
+                    // (Microsoft.UI.Dispatching.Interop.h, Microsoft.Windows
+                    // .AppLifecycle.h). Stacking that stem verbatim under the
+                    // Microsoft.Windows.AppSDK root produced duplicated heads
+                    // (Microsoft.Windows.AppSDK.MICROSOFT.UI.DISPATCHING
+                    // .INTEROP, ...AppSDK.WINDOWS.APPLIFECYCLE). Strip any
+                    // leading Microsoft/Windows segments that merely restate
+                    // the root, and keep the header's own casing instead of
+                    // SCREAMING it — the stem is already dotted and is a valid
+                    // C++ qualified name (Microsoft.UI.Dispatching.Interop ->
+                    // Microsoft.Windows.AppSDK.UI.DISPATCHING.INTEROP).
+                    std::vector<std::string> segs;
+                    {
+                        std::string cur;
+                        for (char c : stem)
+                        {
+                            if (c == '.') { segs.push_back(std::move(cur)); cur.clear(); }
+                            else cur += c;
+                        }
+                        segs.push_back(std::move(cur));
+                    }
+                    auto is_redundant_head = [](std::string s)
+                    {
+                        for (char& c : s) c = char(std::tolower((unsigned char)c));
+                        return s == "microsoft" || s == "windows";
+                    };
+                    // Drop leading segments that only restate the root; never
+                    // drop the whole stem (an all-Microsoft stem falls back to
+                    // its final segment so the namespace stays non-empty).
+                    std::size_t drop = 0;
+                    while (drop + 1 < segs.size() && is_redundant_head(segs[drop])) ++drop;
                     std::string leaf;
-                    for (char c : stem) leaf += char(std::toupper((unsigned char)c));
+                    for (std::size_t i = drop; i < segs.size(); ++i)
+                    {
+                        std::string seg = segs[i];
+                        // Normalize each segment to UPPERCASE and mangle any
+                        // non-identifier char to '_'. Deterministic naming: the
+                        // same header must yield the same namespace no matter
+                        // what casing the NuGet package used on disk
+                        // (Microsoft.UI.Dispatching.Interop.h vs decimal.h), and
+                        // UPPERCASE matches the unmapped-header fallbacks below
+                        // (Windows.Win32.ERRHANDLINGAPI, Windows.Wdk.NTDDK).
+                        std::string fixed;
+                        for (char c : seg)
+                            fixed += (std::isalnum((unsigned char)c) || c == '_')
+                                ? char(std::toupper((unsigned char)c)) : '_';
+                        if (fixed.empty()) fixed = "_";
+                        else if ((fixed[0] >= '0') && (fixed[0] <= '9')) fixed.insert(fixed.begin(), '_');
+                        if (!leaf.empty()) leaf += ".";
+                        leaf += fixed;
+                    }
+                    if (leaf.empty())
+                    {
+                        // Every segment was a redundant head (stem ==
+                        // "Microsoft"/"Windows"): fall back to the uppercased
+                        // stem so the namespace is never empty.
+                        for (char c : stem) leaf += char(std::toupper((unsigned char)c));
+                    }
                     return root + "." + leaf;
                 }
             }
         }
-        // Unmapped headers follow the DIRECTORY they came from: km/ headers
-        // are kernel-mode (Windows.Wdk.*), everything else (um/, shared/,
-        // winrt/, extra -include_dir) is user-mode (Windows.Win32.*). The
-        // old rule keyed off st.include_drivers, which misbucketed hundreds
-        // of unmapped um/ headers (appmodel.h -> Windows.Wdk.APPMODEL) as
-        // soon as driver parsing was enabled.
+        // Unmapped headers follow the DIRECTORY they came from: km/ and
+        // the WDK's wdf/ framework trees are kernel-side (Windows.Wdk.*),
+        // everything else (um/, shared/, winrt/, extra -include_dir) is
+        // user-mode (Windows.Win32.*). The old rule keyed off
+        // st.include_drivers, which misbucketed hundreds of unmapped um/
+        // headers (appmodel.h -> Windows.Wdk.APPMODEL) as soon as driver
+        // parsing was enabled.
         bool is_kernel_header = st.drivers_only
             || filepath.find("\\km\\") != std::string::npos
-            || filepath.find("/km/") != std::string::npos;
+            || filepath.find("/km/") != std::string::npos
+            || filepath.find("\\wdf\\") != std::string::npos
+            || filepath.find("/wdf/") != std::string::npos;
         if (is_kernel_header) {
             std::string result = "Windows.Wdk.";
             for (char c : stem) {

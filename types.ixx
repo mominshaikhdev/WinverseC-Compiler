@@ -301,6 +301,10 @@ struct State {
     bool drivers_only = false;
     bool verbose = false;
     std::set<std::string> parsed_files;
+    // Latest-version KMDF/UMDF header dirs (Include\wdf\{kmdf,umdf}\<ver>)
+    // that parse_sdk actually scanned — recorded so the coverage report
+    // counts them instead of silently omitting the WDF framework.
+    std::vector<std::filesystem::path> wdf_dirs;
     std::unordered_map<std::string, std::vector<std::string>> includes;
     std::unordered_map<std::string, std::string> include_map;
     // -ns <header=Namespace> overrides: lowercased header stem -> explicit

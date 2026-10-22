@@ -80,7 +80,7 @@ The official Microsoft project (github.com/microsoft/wdkmetadata) produces `Wind
 Winverse Compiler employs a five-layer pipeline where each layer operates on a progressively enriched intermediate representation:
 
 ```
-  Windows SDK C/C++ Headers (um/ km/ shared/ — version 26100+)
+  Windows SDK C/C++ Headers (um/ km/ shared/ + WDK wdf/ — version 26100+)
                           |
                           v
   +------------------------------------------------------------------------+
@@ -88,7 +88,7 @@ Winverse Compiler employs a five-layer pipeline where each layer operates on a p
   |  Modules: parser.ixx, preprocessor.ixx, sal.ixx                       |
   |                                                                        |
   |  * Recursive descent parser with #include resolution against SDK      |
-  |    include paths (um, km, shared, winrt)                               |
+  |    include paths (um, km, shared, winrt, wdf)                          |
   |  * Preprocessor evaluation: #ifdef, #if defined(), #elif, #else,      |
   |    #endif — architecture-specific code blocks are resolved at         |
   |    parse time, tagging each declaration with the appropriate         |
@@ -146,7 +146,7 @@ Winverse Compiler employs a five-layer pipeline where each layer operates on a p
   |  Module: validate.ixx                                                  |
   |                                                                        |
   |  * SDK header inventory: enumerates all .h/.hpp/.hxx files across   |
-  |    um, km, and shared directories; reports parsed vs. total         |
+  |    um, km, shared, and wdf directories; reports parsed vs. total    |
   |  * API coverage analysis: counts function declarations, struct      |
   |    definitions, enum definitions, and constants — reports resolved   |
   |    vs. total                                                         |
@@ -397,7 +397,7 @@ winversec.exe -output Windows.Win32+Wdk.winmd
 winversec.exe -include_drivers -output Windows.Win32+Wdk.winmd
 ```
 
-Parses `um/`, `km/`, and `shared/` directories. Produces `Windows.Win32+Wdk.winmd` with both user-mode and kernel-mode APIs: WDF/KMDF/UMDF framework functions, device driver interfaces, and kernel object types.
+Parses `um/`, `km/`, and `shared/` directories plus the WDK's WDF framework trees (`Include\wdf\kmdf\<ver>` and `Include\wdf\umdf\<ver>`, newest installed version of each). Produces `Windows.Win32+Wdk.winmd` with both user-mode and kernel-mode APIs: WDF/KMDF/UMDF framework functions, device driver interfaces, and kernel object types.
 
 ### WDK Only
 
@@ -409,7 +409,7 @@ winversec.exe -drivers_only
 winversec.exe -drivers_only -output MyDriver.winmd
 ```
 
-Parses only `km/` and `shared/` directories. Produces `Windows.Wdk.winmd` with kernel-mode APIs only: `ntddk.h`, `wdm.h`, `fltKernel.h`, `ndis.h`, `storport.h`, WDF framework, and all driver-specific headers.
+Parses only `km/`, `shared/`, and the WDF framework trees (`Include\wdf\{kmdf,umdf}\<ver>`). Produces `Windows.Wdk.winmd` with kernel-mode APIs only: `ntddk.h`, `wdm.h`, `fltKernel.h`, `ndis.h`, `storport.h`, WDF framework, and all driver-specific headers.
 
 ### Windows App SDK Headers (-include_wasdk)
 
@@ -481,9 +481,9 @@ winversec.exe -include_drivers -coverage coverage.html
 | `-sdk <path>` | Windows SDK root | auto-detect any drive |
 | `-version <ver>` | SDK version directory | auto-detect latest |
 | `-output <file>` | Output .winmd path | `Windows.Win32+Wdk.winmd` |
-| `-include_drivers` | Include WDK `km/` headers | on |
+| `-include_drivers` | Include WDK `km/` + `Include\wdf\` framework headers | on |
 | `-no_drivers` | Exclude WDK driver APIs (Win32 only) | off |
-| `-drivers_only` | Only `km/` + `shared/`, skip `um/` | off |
+| `-drivers_only` | Only `km/` + `shared/` + `Include\wdf\`, skip `um/` | off |
 | `-include_wasdk` | Auto-ingest WASDK NuGet headers the SDK lacks | off |
 | `-include_dir <dir>` | Extra header dir, repeatable (SDK stems win) | none |
 | `-ns <h=Namespace>` | Pin a header stem to a namespace, repeatable | none |

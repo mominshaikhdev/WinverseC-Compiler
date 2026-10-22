@@ -2970,11 +2970,18 @@ inline void Enricher::resolve_aw_suffixes()
     {
         auto& td = item.def;
 
-        // SDK partition + kernel/UMDK detection
+        // SDK partition + kernel/UMDK detection. The WDF framework trees
+        // (Include\wdf\kmdf|umdf\<ver>) sit outside km/ and um/, so classify
+        // them by flavor too — otherwise every Wdf* API lands in "shared"
+        // and misses the km-only DriverType/WdfObject/NoThrow extras below.
+        bool is_wdf_km = td.source_header.find("/wdf/kmdf/") != std::string::npos ||
+                         td.source_header.find("\\wdf\\kmdf\\") != std::string::npos;
+        bool is_wdf_um = td.source_header.find("/wdf/umdf/") != std::string::npos ||
+                         td.source_header.find("\\wdf\\umdf\\") != std::string::npos;
         bool is_km = td.source_header.find("/km/") != std::string::npos ||
-                     td.source_header.find("\\km\\") != std::string::npos;
+                     td.source_header.find("\\km\\") != std::string::npos || is_wdf_km;
         bool is_um = td.source_header.find("/um/") != std::string::npos ||
-                     td.source_header.find("\\um\\") != std::string::npos;
+                     td.source_header.find("\\um\\") != std::string::npos || is_wdf_um;
         bool is_wasdk = td.source_header.find("windowsappsdk") != std::string::npos ||
                         td.source_header.find("WindowsAppSDK") != std::string::npos;
         td.attributes.push_back(attr::make_partition(is_km ? "km" : (is_um ? "um" : "shared")));
@@ -3174,6 +3181,14 @@ inline void Enricher::resolve_aw_suffixes()
             // often carries no hint.
             if (td.kind == Kind::Delegate && td.fn_class.starts_with("DRIVER_DISPATCH"))
                 td.attributes.push_back(attr::make_driver_dispatch(0, 0));
+        }
+        // UMDF flavor of the same framework (Include\wdf\umdf): same Wdf*
+        // surface, user-mode side — tagged UMDF so projections never fold
+        // it into the kernel flavor.
+        else if (is_wdf_um && (td.name.starts_with("Wdf") || td.name.starts_with("WDF")))
+        {
+            td.attributes.push_back(attr::make_driver_type(attr::DriverTypeVal::UMDF));
+            td.attributes.push_back(attr::make_wdf_object((uint32_t)attr::DriverTypeVal::UMDF));
         }
         if (td.name.find("POWER_STATE") != std::string::npos)
             td.attributes.push_back(attr::make_power_state(0));
