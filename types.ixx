@@ -315,7 +315,7 @@ struct State {
     // Scanned from NuGet import libs: exported function name -> "<dll>.dll".
     std::unordered_map<std::string, std::string> dll_imports;
     // include dir -> namespace root for its flat-C headers (map_ns appends
-    // the header stem; e.g. WASDK MRM.h -> Microsoft.Windows.AppSDK.MRM).
+    // the header stem; e.g. WASDK MRM.h -> Windows.Win32.AppSDK.MRM).
     std::unordered_map<std::string, std::string> extra_include_ns;
     std::vector<ParseError> errors;
     std::atomic<size_t> files_parsed_atomic{0};

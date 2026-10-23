@@ -3498,14 +3498,14 @@ private:
                     // WASDK headers are named after the API they expose
                     // (Microsoft.UI.Dispatching.Interop.h, Microsoft.Windows
                     // .AppLifecycle.h). Stacking that stem verbatim under the
-                    // Microsoft.Windows.AppSDK root produced duplicated heads
-                    // (Microsoft.Windows.AppSDK.MICROSOFT.UI.DISPATCHING
-                    // .INTEROP, ...AppSDK.WINDOWS.APPLIFECYCLE). Strip any
-                    // leading Microsoft/Windows segments that merely restate
-                    // the root, and keep the header's own casing instead of
-                    // SCREAMING it — the stem is already dotted and is a valid
-                    // C++ qualified name (Microsoft.UI.Dispatching.Interop ->
-                    // Microsoft.Windows.AppSDK.UI.DISPATCHING.INTEROP).
+                    // Windows.Win32.AppSDK root produced duplicated heads
+                    // (...AppSDK.MICROSOFT.UI.DISPATCHING.INTEROP,
+                    // ...AppSDK.WINDOWS.APPLIFECYCLE). Strip any leading
+                    // Microsoft/Windows segments that merely restate the
+                    // header's own product prefix, then UPPERCASE each
+                    // remaining segment so the same header yields the same
+                    // namespace on every machine (Microsoft.UI.Dispatching
+                    // .Interop -> Windows.Win32.AppSDK.UI.DISPATCHING.INTEROP).
                     std::vector<std::string> segs;
                     {
                         std::string cur;
@@ -3519,7 +3519,10 @@ private:
                     auto is_redundant_head = [](std::string s)
                     {
                         for (char& c : s) c = char(std::tolower((unsigned char)c));
-                        return s == "microsoft" || s == "windows";
+                        // "microsoft"/"windows" restate either the AppSDK root
+                        // (Windows.Win32.AppSDK) or the header's own product
+                        // prefix; "appsdk" would restate the root's last segment.
+                        return s == "microsoft" || s == "windows" || s == "appsdk";
                     };
                     // Drop leading segments that only restate the root; never
                     // drop the whole stem (an all-Microsoft stem falls back to
@@ -3549,8 +3552,8 @@ private:
                     if (leaf.empty())
                     {
                         // Every segment was a redundant head (stem ==
-                        // "Microsoft"/"Windows"): fall back to the uppercased
-                        // stem so the namespace is never empty.
+                        // "Microsoft"/"Windows"/"AppSDK"): fall back to the
+                        // uppercased stem so the namespace is never empty.
                         for (char c : stem) leaf += char(std::toupper((unsigned char)c));
                     }
                     return root + "." + leaf;

@@ -378,9 +378,12 @@ int main(int argc, char* argv[]) {
                     if (fs::is_directory(inc))
                     {
                         state.extra_include_dirs.push_back(inc);
-                        // WASDK package flat-C headers -> Microsoft.Windows.AppSDK
+                        // WASDK package flat-C headers -> Windows.Win32.AppSDK
+                        // (nested under Windows.Win32 so the flat-C AppSDK APIs
+                        // sit alongside the rest of the Win32 projection rather
+                        // than under a Microsoft.* root of their own)
                         state.extra_include_ns[inc.lexically_normal().generic_string()] =
-                            "Microsoft.Windows.AppSDK";
+                            "Windows.Win32.AppSDK";
                         found_any = true;
                         if (verbose) std::cout << "WASDK include: " << inc.string() << "\n";
                         break;  // highest version with an include dir wins
