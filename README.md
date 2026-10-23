@@ -450,9 +450,16 @@ the official win32metadata homes:
 
 **Flat-C WindowsAppSDK APIs — automatic namespaces and DLL imports:** every other WASDK header needs no table entry:
 
-- **Namespace**: `Microsoft.Windows.AppSDK.<HeaderStem>` (`MRM.h` ->
-  `Microsoft.Windows.AppSDK.MRM`). `-ns` pins and the stem table above
-  take precedence.
+- **Namespace**: `Windows.Win32.AppSDK.<HeaderStem>` (`MRM.h` ->
+  `Windows.Win32.AppSDK.MRM`), so the flat-C AppSDK APIs sit alongside the
+  rest of the Win32 projection rather than under a `Microsoft.*` root of
+  their own. WASDK headers are named after the API they expose
+  (`Microsoft.UI.Dispatching.Interop.h`), so any leading `Microsoft`,
+  `Windows` or `AppSDK` segment — which would only restate the root — is
+  dropped and the remaining segments are uppercased for deterministic
+  naming (`Microsoft.UI.Dispatching.Interop.h` ->
+  `Windows.Win32.AppSDK.UI.DISPATCHING.INTEROP`). `-ns` pins and the stem
+  table above take precedence.
 - **DLL import**: each package's import libs (`lib/native/x64/*.lib`,
   then x86/arm64/arm64ec) are scanned for exported symbols; the dll name
   comes from the import descriptor in the binary (`MrmCreateResourceManager`
