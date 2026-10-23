@@ -366,12 +366,24 @@ restored = LongToHandle(value)
 Requires Visual Studio 2026 (version 18 or later) with the C++ desktop workload and Windows SDK 10.0.26100.0.
 
 ```batch
-build.bat              :: Debug build
-build.bat Release      :: Release build
-build.bat Clean        :: Remove build artifacts
+build.bat              :: Debug build    -> build\Debug\winversec.exe
+build.bat Release      :: Release build  -> build\Release\winversec.exe
+build.bat Clean        :: Remove build artifacts (both configurations)
 ```
 
-Output binary: `build\winversec.exe`
+Each configuration owns its own output directory for `.obj` / `.ifc` / `.log`
+files, so Debug and Release coexist and switching configurations can never
+link objects built against a different CRT.
+
+| Configuration | Compile flags | Link flags | Output |
+|---|---|---|---|
+| Debug | `/Od /Zi /D_DEBUG /MDd` | `/DEBUG` | `build\Debug\winversec.exe` + `winversec.pdb` |
+| Release | `/O2 /DNDEBUG /GL /MD` | `/LTCG /OPT:REF /OPT:ICF /RELEASE` | `build\Release\winversec.exe` |
+
+Debug `/Od` is deliberate, and `/RTC1` is deliberately absent: runtime error
+checks are incompatible with the `/EHa` async EH model this project uses.
+A release copy for distribution is placed in the repo root as
+`winversec.exe`.
 
 ## Usage
 
