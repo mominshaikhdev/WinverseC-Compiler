@@ -180,6 +180,17 @@ static void scan_import_lib(const std::filesystem::path& lib,
     std::vector<std::string> pend;
     std::string cur_dll;
     std::string fallback_dll;
+    // Import evidence: at least one "<name>.dll" string or
+    // __IMPORT_DESCRIPTOR_<mod> member must have been seen in this file
+    // before any symbol is attributed to it. Static archives (libucrt.lib,
+    // libcmt.lib, muiload.lib, wiautil.lib, htmlhelp.lib) contain none of
+    // either yet are full of identifier strings they merely *reference*
+    // (CRT names, strsafe inlines compiled into a helper object, ...);
+    // without this gate the final flush below bound every such identifier
+    // to the lib FILE name and static libs out-competed the real import
+    // libs (libucrt.lib stole CRT rows from ucrt.lib, muiload.lib/wiautil.lib
+    // became "providers" of StringCch*). First-wins then made it stick.
+    bool saw_import = false;
     auto flush = [&](std::string const& dll) {
         std::string const& value = !fixed_value.empty() ? fixed_value : dll;
         if (value.empty()) return;
@@ -213,12 +224,18 @@ static void scan_import_lib(const std::filesystem::path& lib,
             for (auto& ch : low) ch = (char)std::tolower((unsigned char)ch);
             if (low.rfind(".dll", low.size() - 4) == low.size() - 4 && is_ident(low.substr(0, low.size() - 4)))
             {
+                saw_import = true;
                 if (cur_dll != s) { flush(s); cur_dll = s; }
                 continue;
             }
             static const std::string desc = "__IMPORT_DESCRIPTOR_";
             if (s.rfind(desc, 0) == 0)
             {
+                // Evidence even when the module name is an api-set
+                // ("api-ms-win-crt-stdio-l1-1-0" carries hyphens and
+                // fails is_ident below, but the descriptor proves an
+                // import object: ucrt.lib is exactly this shape).
+                saw_import = true;
                 std::string mod = s.substr(desc.size());
                 if (is_ident(mod) && fallback_dll.empty()) fallback_dll = mod + ".dll";
                 continue;
@@ -226,7 +243,8 @@ static void scan_import_lib(const std::filesystem::path& lib,
         }
         if (is_ident(s)) pend.push_back(std::move(s));
     }
-    flush(cur_dll.empty() ? fallback_dll : cur_dll);
+    if (saw_import)
+        flush(cur_dll.empty() ? fallback_dll : cur_dll);
 }
 
 int main(int argc, char* argv[]) {

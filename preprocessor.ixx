@@ -179,6 +179,48 @@ public:
             uint32_t a = 0, b = 0;
             return eval_shift(lhs, a) && eval_primary(rhs, b) && ((out = a >> b), true);
         }
+        return eval_addsub(s, out);
+    }
+    // Binary +/- binds tighter than << >> and looser than unary — C
+    // precedence: ED_BASE+439L, FILE_DEVICE_NETWORK+N, 0x10-1. Without
+    // this level every additive constant failed eval and was silently
+    // dropped by materialize_int_consts (the | ^ & << >> chains resolved
+    // fine, so the gap only showed on expression-valued defines).
+    // Split at the LAST top-level +/- (left-associative via recursion);
+    // reject a split whose lhs ENDS with an operator ('1+-2', 'A<<-1')
+    // so the sign stays unary and the digit path sees the whole atom.
+    bool eval_addsub(std::string_view s, uint32_t& out) const {
+        int depth = 0;
+        for (size_t i = s.size(); i-- > 0;) {
+            char c = s[i];
+            if (c == ')') { ++depth; continue; }
+            if (c == '(') { if (--depth < 0) return false; continue; }
+            if ((c == '+' || c == '-') && depth == 0 && i > 0) {
+                // previous non-space char on the lhs: an operator or open
+                // paren means this is a sign, not a subtraction
+                size_t j = i;
+                while (j > 0 && (unsigned char)s[j - 1] <= ' ') --j;
+                if (j == 0) continue;
+                char p = s[j - 1];
+                if (p == '+' || p == '-' || p == '*' || p == '/' || p == '%' ||
+                    p == '&' || p == '|' || p == '^' || p == '<' || p == '>' ||
+                    p == '(' || p == '~' || p == '!')
+                    continue;
+                auto lhs = s.substr(0, i);
+                auto rhs = s.substr(i + 1);
+                eval_trim(lhs);
+                eval_trim(rhs);
+                if (lhs.empty() || rhs.empty()) continue;
+                uint32_t a = 0, b = 0;
+                if (eval_addsub(lhs, a) && eval_primary(rhs, b)) {
+                    out = (c == '+') ? a + b : a - b;
+                    return true;
+                }
+                // a failed split here is not decisive (e.g. an earlier
+                // textual '-' inside an identifier is impossible, but a
+                // nested cast may split differently) — keep scanning
+            }
+        }
         return eval_primary(s, out);
     }
     bool eval_primary(std::string_view s, uint32_t& out) const {

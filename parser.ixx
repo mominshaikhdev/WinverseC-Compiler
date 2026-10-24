@@ -875,7 +875,16 @@ private:
             // by a higher version check (threadpoolapiset's `#if (_WIN32_WINNT >= 0x0600)`).
             if (!active) return;
             auto after = tr(t.substr(6));
-            auto sp = after.find(' ');
+            // Split name/value at the first WHITESPACE, not just ' '. SDK
+            // headers use tab-separated defines with trailing comments
+            // (`#define ICW_MAX_PASSWORD\t256\t// PWLEN`): find(' ') walked
+            // past the tabs into the comment BODY, so the macro NAME came
+            // back as "ICW_MAX_PASSWORD\t256\t//" (emitted verbatim into
+            // #undef/enum/constexpr lines -> C2059/C2143/C1071) and the
+            // VALUE became the comment text ("32-bit constant" evaluated
+            // to 32). Tab-aware split + the comment strip below yields the
+            // clean name and the real value.
+            auto sp = after.find_first_of(" \t");
             if (sp != std::string_view::npos) {
                 auto nm = tr(after.substr(0, sp));
                 auto val = tr(after.substr(sp + 1));
@@ -928,6 +937,13 @@ private:
                             vtext.erase(cp, ce + 2 - cp);
                         }
                         if (auto cs = vtext.find("//"); cs != std::string::npos) vtext.erase(cs);
+                        // A tab-split value keeps its leading/trailing tabs
+                        // (`#define ED_TCD_TRANSPARENCY\t\tED_BASE+439L\t// ..`
+                        // -> "\t\tED_BASE+439L"); eval_macro_int does not skip
+                        // tabs, so eval failed and materialize_int_consts
+                        // silently DROPPED the constant. Trim like every other
+                        // captured text.
+                        vtext = std::string(tr(vtext));
                         std::lock_guard<std::mutex> lk(g_define_record_mtx);
                         pp.st.int_consts.push_back({ std::string(nm), 0, map_ns(file), file, std::move(vtext) });
                     }

@@ -164,16 +164,18 @@ inline void Enricher::materialize_int_consts()
         }
     std::set<std::string, std::less<>> seen;
     size_t materialized = 0;
+    size_t n_ns_empty = 0, n_dup = 0, n_reserved = 0, n_evalfail = 0;
     for (auto const& ic : st.int_consts)
     {
-        if (ic.ns.empty()) continue;
-        if (!seen.insert(ic.name).second) continue;
-        if (reserved.contains(ic.name)) continue;
+        if (ic.ns.empty()) { ++n_ns_empty; continue; }
+        if (!seen.insert(ic.name).second) { ++n_dup; continue; }
+        if (reserved.contains(ic.name)) { ++n_reserved; continue; }
         uint32_t cval = 0;
         if (!evalpp.eval_macro_int(ic.value_text, cval)) {
-            if (st.verbose && (ic.name == "KEY_READ" || ic.name == "WS_OVERLAPPEDWINDOW" ||
-                                ic.name.rfind("WS_", 0) == 0))
-                std::fprintf(stderr, "[int_consts] eval-fail %s = '%s'\n", ic.name.c_str(), ic.value_text.c_str());
+            ++n_evalfail;
+            if (st.verbose)
+                std::fprintf(stderr, "[int_consts] eval-fail %s = '%.90s'\n",
+                             ic.name.c_str(), ic.value_text.c_str());
             continue;
         }
         TDef td;
@@ -193,7 +195,9 @@ inline void Enricher::materialize_int_consts()
         st.nss.insert(ic.ns);
         ++materialized;
     }
-    if (st.verbose) std::fprintf(stderr, "[int_consts] materialized=%zu\n", materialized);
+    if (st.verbose)
+        std::fprintf(stderr, "[int_consts] materialized=%zu dropped: ns_empty=%zu dup=%zu reserved=%zu eval_fail=%zu\n",
+                     materialized, n_ns_empty, n_dup, n_reserved, n_evalfail);
 }
 
 // Callback typedef names (Kind::Delegate / is_callback). A param typed

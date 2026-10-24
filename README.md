@@ -169,11 +169,11 @@ Winverse Compiler employs a five-layer pipeline where each layer operates on a p
 | **Configuration overhead** | 191,762 lines across 372+ files | N/A | 2,756 lines (1 `.rsp` file) | ~200-line namespace mapping |
 | **Partition management** | 647 hand-maintained subdirectories | N/A | IdlHeaders: 5,374 `.h` (flat) | Automatic by header |
 | **Metadata generation** | Yes, via C# intermediary | No — reads existing `.winmd` only | Yes, via WinmdGenerator | Yes, direct from C/C++ headers |
-| **Driver API support** | Partial (kernel-mode headers) | None | Partial (experimental) | Basic — WDK types/enums/funcs emitted, bogus API cleanup applied |
+| **Driver API support** | Partial (kernel-mode headers) | None | Partial (experimental) | Full — DriverType (KMDF/UMDF/WDM) + WdfObject + DriverDispatch + IrpMajorFunction (from materialized `IRP_MJ_*`) + NoThrow + SAL buffer/string semantics + bogus-macro-row cleanup |
 | **Handle taxonomy** | `autoTypes.json` (2,984 lines, manual) | None | None — inherits from win32metadata | 6 kinds detected (File, Event, Thread, Process, Registry, Service) |
 | **Buffer semantics** | Partial SAL propagation | None | None | SAL -> BufferSemanticsAttribute + StringNullAttribute emitted from `_In_`/`_Out_`/`_Inout_`/`_In_reads_`/`_Out_writes_`/`_Null_terminated_` annotations |
 | **IOCTL metadata** | None — raw integers only | None | None — raw integers only | IoctlCodeAttribute + IoctlBufferingAttribute emitted from IOCTL_* enum constant decoding |
-| **COM interface support** | Basic COM detection | None | None | Basic — direct base class IID + vtable index |
+| **COM interface support** | Basic COM detection | None | None | Full — ComInterface (IID + flags), per-method ComMethod vtable slots, ComProperty/ComEvent slot pairing, ComCoClass CLSIDs |
 | **Enum flags detection** | 37,097-line manual JSON | None | None — inherits from win32metadata | Automatic bitmask pattern analysis (>=3 bits set -> flags) |
 | **Namespace model** | Flat `Apis` static class | Flat `Apis` container expansion | Flat `Windows.Wdk` hierarchy | Semantic domain grouping |
 | **Custom attribute set** | ~10 projection-specific attributes | None — projections hardcode rules | None — inherits from win32metadata | 64 defined, all actively emitted |
@@ -251,7 +251,7 @@ let file = CreateFileW(w!("data.txt"), GENERIC_READ, FILE_SHARE_READ,
 // Caller must CloseHandle
 ```
 
-#### C++23 Modules / CppWinC
+#### C++23 Modules / [CppWinC](https://github.com/mominshaikhdev/CppWinC-Compiler)
 ```cpp
 import std;
 import Windows.Win32.Storage.FileSystem;
