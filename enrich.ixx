@@ -20,6 +20,7 @@ export module winversec.enrich;
 
 import winversec.types;
 import winversec.attributes;
+import winversec.preprocessor;
 
 export namespace wv {
 
@@ -54,6 +55,7 @@ private:
     void init_dll_map();
     void materialize_ioctl_consts();
     void materialize_irp_mj_consts();
+    void materialize_int_consts();
     void init_callback_names();
     std::set<std::string, std::less<>> callback_names_;
     void enrich_type(Item& item);
@@ -126,6 +128,74 @@ inline void Enricher::materialize_irp_mj_consts()
     }
 }
 
+// General numeric #define constants materialize as single-member enum rows
+// (the metadata-native constant shape; the C++ projection renders singleton
+// enums as exported `constexpr` constants). First definition wins per name,
+// and any name already claimed by a type or enumerator is left alone so a
+// stray macro can never shadow a real API surface name.
+inline void Enricher::materialize_int_consts()
+{
+    if (st.verbose) std::fprintf(stderr, "[int_consts] recorded=%zu\n", st.int_consts.size());
+    std::set<std::string, std::less<>> reserved;
+    for (auto const& item : st.items)
+    {
+        if (!item.def.name.empty()) reserved.insert(item.def.name);
+        for (auto const& f : item.def.fields)
+            if (!f.name.empty()) reserved.insert(f.name);
+    }
+    // Merged define table for DEFERRED evaluation: each header was parsed
+    // against a copy of the seed preprocessor, so cross-header value chains
+    // (KEY_READ -> STANDARD_RIGHTS_READ -> READ_CONTROL,
+    // WS_OVERLAPPEDWINDOW -> WS_OVERLAPPED -> ...) never resolved during
+    // the parse. Rebuild the effective table here (first definition of a
+    // name wins, matching the first-wins emission below) and evaluate every
+    // raw value against it.
+    Preprocessor evalpp(st);
+    std::set<std::string, std::less<>> defined;
+    for (auto const& ic : st.int_consts)
+        if (!ic.value_text.empty() && defined.insert(ic.name).second) {
+            if (st.verbose && (ic.name == "KEY_READ" || ic.name == "WS_OVERLAPPEDWINDOW" ||
+                                ic.name == "WS_CAPTION" || ic.name == "WS_SYSMENU" ||
+                                ic.name == "WS_THICKFRAME" || ic.name == "WS_MINIMIZEBOX" ||
+                                ic.name == "WS_MAXIMIZEBOX" || ic.name == "WS_BORDER" ||
+                                ic.name == "WS_DLGFRAME" || ic.name == "WS_OVERLAPPED"))
+                std::fprintf(stderr, "[int_consts] table %s = '%s' (from %s)\n", ic.name.c_str(), ic.value_text.c_str(), ic.header.c_str());
+            evalpp.set_define(ic.name, ic.value_text);
+        }
+    std::set<std::string, std::less<>> seen;
+    size_t materialized = 0;
+    for (auto const& ic : st.int_consts)
+    {
+        if (ic.ns.empty()) continue;
+        if (!seen.insert(ic.name).second) continue;
+        if (reserved.contains(ic.name)) continue;
+        uint32_t cval = 0;
+        if (!evalpp.eval_macro_int(ic.value_text, cval)) {
+            if (st.verbose && (ic.name == "KEY_READ" || ic.name == "WS_OVERLAPPEDWINDOW" ||
+                                ic.name.rfind("WS_", 0) == 0))
+                std::fprintf(stderr, "[int_consts] eval-fail %s = '%s'\n", ic.name.c_str(), ic.value_text.c_str());
+            continue;
+        }
+        TDef td;
+        td.kind = Kind::Enum;
+        td.ns = ic.ns;
+        td.name = ic.name;
+        td.attr = TA::Pub;
+        td.source_header = ic.header;
+        FDef f;
+        f.name = ic.name;
+        f.attr = FA::Pub | FA::Literal | FA::InitOnly;
+        f.type = ET::U4;
+        f.def.type = ET::U4;
+        f.def.v = cval;
+        td.fields.push_back(std::move(f));
+        st.items.push_back({ std::move(td), Ar::All, ic.header });
+        st.nss.insert(ic.ns);
+        ++materialized;
+    }
+    if (st.verbose) std::fprintf(stderr, "[int_consts] materialized=%zu\n", materialized);
+}
+
 // Callback typedef names (Kind::Delegate / is_callback). A param typed
 // with one of these plus an _Opt_ SAL marker is an optional callback —
 // the CallbackOptional attribute, which previously required an inline
@@ -144,6 +214,7 @@ inline void Enricher::run()
     init_callback_names();
     materialize_ioctl_consts();
     materialize_irp_mj_consts();
+    materialize_int_consts();
     for (auto& item : st.items)
     {
         enrich_type(item);
@@ -158,6 +229,7 @@ inline void Enricher::run_parallel(size_t num_threads)
     init_callback_names();
     materialize_ioctl_consts();
     materialize_irp_mj_consts();
+    materialize_int_consts();
     if (st.items.empty() || num_threads <= 1)
     {
         run();
@@ -2532,11 +2604,30 @@ inline void Enricher::enrich_type(Item& item)
                     td.attributes.push_back(attr::make_dll_import(nit->second));
                     td.attributes.push_back(attr::make_export_function(td.name));
                 }
+                else if (auto sit = st.sdk_lib_imports.find(td.name); sit != st.sdk_lib_imports.end())
+                {
+                    // Windows SDK import-lib scan (populated at RUN time from
+                    // the SDK's own um/ucrt lib trees): any API a FUTURE SDK
+                    // ships — headers no curated table entry knows yet — gets
+                    // a linkable attribution with no winversec edit/rebuild.
+                    // Value is the lib FILE name (kernel32.lib), which is what
+                    // the downstream linker consumes.
+                    td.import_library = sit->second;
+                    td.entry_point = td.name;
+                    td.attributes.push_back(attr::make_import_library({
+                        .dll = sit->second,
+                        .entry_point = td.name,
+                    }));
+                    td.attributes.push_back(attr::make_dll_import(sit->second));
+                    td.attributes.push_back(attr::make_export_function(td.name));
+                }
 
                 auto cc = CC::Def;
                 if (!td.import_library.empty() &&
                     (td.import_library == "ucrtbase.dll" || td.import_library == "msvcrt.dll" ||
-                     td.import_library == "msvcp140.dll" || td.import_library == "vcruntime140.dll"))
+                     td.import_library == "msvcp140.dll" || td.import_library == "vcruntime140.dll" ||
+                     td.import_library == "ucrt.lib" || td.import_library == "libucrt.lib" ||
+                     td.import_library == "msvcrt.lib"))
                     cc = CC::Cdecl;
                 else
                 {
@@ -2555,7 +2646,8 @@ inline void Enricher::enrich_type(Item& item)
                 {
                     bool is_winsock = false;
                     if (td.import_library == "ws2_32.dll" || td.import_library == "wsock32.dll" ||
-                        td.import_library == "mswsock.dll")
+                        td.import_library == "mswsock.dll" || td.import_library == "ws2_32.lib" ||
+                        td.import_library == "wsock32.lib" || td.import_library == "mswsock.lib")
                         is_winsock = true;
                     auto& n = td.name;
                     if (n.starts_with("WSA"))

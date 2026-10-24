@@ -279,6 +279,26 @@ struct IoctlConst {
     uint32_t value = 0;
 };
 
+// A general numeric `#define` constant (GENERIC_READ, KEY_READ, WM_DESTROY,
+// WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, the predefined HKEY_* roots, ...) —
+// evaluated by the parser and attributed to its defining header's
+// namespace. The C preprocessor never materializes object-like macros as
+// enum members, so without this capture every flag/constant family in the
+// SDK is absent from the winmd and projection consumers must hardcode hex
+// literals.
+struct IntConst {
+    std::string name;
+    uint32_t value = 0;
+    std::string ns;
+    std::string header;
+    // Raw #define value text. Evaluation is DEFERRED to enrichment: each
+    // parsed header works on a copy of the seed preprocessor, so value
+    // chains that cross headers ((KEY_READ | ... ) -> READ_CONTROL from
+    // winnt.h) cannot resolve during the parse. The enricher evaluates
+    // every entry against the merged define table instead.
+    std::string value_text;
+};
+
 struct State {
     std::vector<Item> items;
     std::vector<IoctlConst> ioctl_consts;
@@ -286,6 +306,8 @@ struct State {
     // IOCTLs they never become enum members; the enricher materializes
     // them into enum rows carrying IrpMajorFunction attributes.
     std::vector<IoctlConst> irp_mj_consts;
+    // General numeric #define constants — see IntConst above.
+    std::vector<IntConst> int_consts;
     std::set<std::string> nss;
     std::string asm_name = "Windows.Win32";
     std::string asm_ver = "26100.0.0";
@@ -314,6 +336,17 @@ struct State {
     std::unordered_map<std::string, std::string> ns_overrides;
     // Scanned from NuGet import libs: exported function name -> "<dll>.dll".
     std::unordered_map<std::string, std::string> dll_imports;
+    // Windows SDK import-lib scans (symbol -> lib FILE name, e.g.
+    // "kernel32.lib"), populated at RUN time in main() from the SDK's own
+    // lib trees. The curated dll_map_ table necessarily lags every new
+    // Windows release; these maps are the data-driven fallback that gives
+    // BRAND-NEW future SDK/WDK APIs a correct linkable attribution with no
+    // winversec table edit or rebuild — mirroring the namespace fallback's
+    // "new headers just work" behavior. sdk_lib_imports = um + ucrt (user
+    // mode, consulted by the Win32 enricher); km_lib_imports = km (kernel
+    // mode, consulted by the driver enricher after its curated name rules).
+    std::unordered_map<std::string, std::string> sdk_lib_imports;
+    std::unordered_map<std::string, std::string> km_lib_imports;
     // include dir -> namespace root for its flat-C headers (map_ns appends
     // the header stem; e.g. WASDK MRM.h -> Windows.Win32.AppSDK.MRM).
     std::unordered_map<std::string, std::string> extra_include_ns;

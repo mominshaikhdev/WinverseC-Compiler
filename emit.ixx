@@ -812,6 +812,33 @@ private:
 
     void build_custom_attribute_table() {
         for (size_t i = 0; i < st.items.size(); ++i) {
+            {
+                // Scalar typedef alias target: record the resolved primitive
+                // element type on the field-less alias row (DWORD -> U4,
+                // RPC_STATUS -> I4, BOOL -> I4) so the C++ projection can
+                // emit `using DWORD = std::uint32_t;` instead of guessing
+                // void* from a row that carries no fields. Ptr/Class targets
+                // (HANDLE, HKEY, GUID chains) stay targetless — opaque
+                // handles flatten to void* by projection design.
+                auto& _ad = st.items[i].def;
+                if (_ad.kind == Kind::Class && _ad.fields.empty() && _ad.meths.empty() &&
+                    !_ad.name.empty()) {
+                    ET _at = _ad.alias_elem;
+                    bool _prim = _at == ET::Bool || _at == ET::Char ||
+                        _at == ET::I1 || _at == ET::U1 || _at == ET::I2 || _at == ET::U2 ||
+                        _at == ET::I4 || _at == ET::U4 || _at == ET::I8 || _at == ET::U8 ||
+                        _at == ET::R4 || _at == ET::R8;
+                    if (_prim) {
+                        // "<code>|<ptr-depth>" — LPWSTR (WCHAR*) must keep its
+                        // pointer level or the projection spells it without '*'.
+                        Attribute _aa; _aa.ns = "Winverse.Attributes"; _aa.name = "AliasTarget";
+                        _aa.positional.push_back(AttrVal(AttrVal::Kind::String,
+                            std::to_string(static_cast<uint8_t>(_at)) + "|" +
+                            std::to_string(_ad.alias_ref.ptr)));
+                        _ad.attributes.push_back(std::move(_aa));
+                    }
+                }
+            }
             for (auto& a : st.items[i].def.attributes) {
                 uint32_t mr_idx = resolve_attr_type_ref(a);
             custom_attribute_table_.push_back({

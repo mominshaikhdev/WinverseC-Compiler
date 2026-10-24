@@ -357,7 +357,7 @@ private:
                     auto line_start = pos + 1;
                     auto line_end = src.find('\n', line_start);
                     if (line_end == std::string_view::npos) line_end = src.size();
-                    handle_pp(src.substr(line_start, line_end - line_start), pp, ifdef_stack, active);
+                    handle_pp(src.substr(line_start, line_end - line_start), pp, ifdef_stack, active, filename);
                     skip_to_eol(src, pos);
                     continue;
                 }
@@ -382,7 +382,7 @@ private:
                 auto line_start = pos + 1;
                 size_t dir_end = line_start;
                 auto directive = join_continued(src, line_start, dir_end);
-                handle_pp(directive, pp, ifdef_stack, active);
+                handle_pp(directive, pp, ifdef_stack, active, filename);
                 pos = dir_end;
                 continue;
             }
@@ -859,7 +859,8 @@ private:
     // preprocessor handling
 
     void handle_pp(std::string_view directive, Preprocessor& pp,
-                   std::vector<bool>& ifdef_stack, bool& active) {
+                   std::vector<bool>& ifdef_stack, bool& active,
+                   const std::string& file) {
         auto t = tr(directive);
         if (t.starts_with("include")) return;
         if (t.starts_with("pragma")) return;
@@ -900,6 +901,35 @@ private:
                             std::lock_guard<std::mutex> lk(g_define_record_mtx);
                             pp.st.irp_mj_consts.push_back({ std::string(nm), code });
                         }
+                    }
+                    // Every other object-like #define is a candidate
+                    // public Win32/WDK constant — GENERIC_READ, KEY_READ,
+                    // WM_DESTROY, WS_OVERLAPPEDWINDOW, the predefined HKEY_*
+                    // roots. Attribute each to the defining header's
+                    // namespace and record the RAW value: evaluation is
+                    // deferred to enrichment (per-file preprocessor copies
+                    // cannot resolve value chains across headers). Skip
+                    // internal (leading '_') and function-like names, plus
+                    // the specialized captures above.
+                    if (!nm.empty() && nm[0] != '_' &&
+                        nm.find('(') == std::string_view::npos &&
+                        nm.find(')') == std::string_view::npos &&
+                        !nm.starts_with("IOCTL_") && !nm.starts_with("FSCTL_") &&
+                        !nm.starts_with("IRP_MJ_")) {
+                        std::string vtext(val);
+                        // Strip /* ... */ and // comments — SDK values carry
+                        // trailing explanations whose text often contains '|'
+                        // (WS_CAPTION = 0x00C00000L /* WS_BORDER | WS_DLGFRAME */
+                        // split at the comment's pipe and failed to evaluate).
+                        for (std::size_t cp = vtext.find("/*");
+                             cp != std::string::npos; cp = vtext.find("/*")) {
+                            auto ce = vtext.find("*/", cp + 2);
+                            if (ce == std::string::npos) { vtext.erase(cp); break; }
+                            vtext.erase(cp, ce + 2 - cp);
+                        }
+                        if (auto cs = vtext.find("//"); cs != std::string::npos) vtext.erase(cs);
+                        std::lock_guard<std::mutex> lk(g_define_record_mtx);
+                        pp.st.int_consts.push_back({ std::string(nm), 0, map_ns(file), file, std::move(vtext) });
                     }
                 }
             } else if (!after.empty()) {
@@ -999,6 +1029,28 @@ private:
         std::string typedef_fn_class;
         for (auto const& ann : sal.parse_all(src, pos)) {
             if (ann.kind == SalKind::FunctionClass) typedef_fn_class = ann.count_expr;
+        }
+        // WDK API-linkage macros sit between the SAL run and the return type
+        // (`typedef _IRQL_requires_max_(PASSIVE_LEVEL) WDFAPI ULONG (NTAPI
+        // *PFN_X)(...)`): read_type would swallow WDFAPI as the RETURN TYPE
+        // and the real return type became the declared NAME, producing
+        // bogus delegates named ULONG/UCHAR/BYTE. Skip them now that the
+        // annotations are consumed; unknown idents rewind as usual.
+        skip_decl_specifiers(src, pos, true);
+        // The first lookahead_fnptr (dispatch, before the SAL run) ran with
+        // the cursor on an annotation and could not see the `(`; retry now
+        // that the cursor sits on the return type — otherwise
+        // `typedef ULONG (NTAPI *PFN_X)(...)` fell through to the scalar
+        // path, read_ident found '(' instead of a name, and the whole
+        // callback declaration was dropped.
+        if (lookahead_fnptr(src, pos)) {
+            size_t _n_before = items.size();
+            parse_fnptr(src, pos, file, pp, active, items, nss);
+            // parse_fnptr re-scans for annotations but the SAL run was already
+            // consumed above — carry the captured _Function_class_ over.
+            if (items.size() > _n_before && !typedef_fn_class.empty())
+                items.back().def.fn_class = std::move(typedef_fn_class);
+            return;
         }
         auto type = read_type(src, pos);
         skip_ws(src, pos);
@@ -1243,6 +1295,12 @@ private:
             TDef td; td.kind = is_union ? Kind::Union : Kind::Struct;
             td.ns = ns; td.name = name; td.attr = TA::Pub; td.is_union = is_union;
             td.source_header = file;
+            if (name.empty()) {
+                size_t _ps = pos > 140 ? pos - 140 : 0;
+                std::string _sc(src.substr(_ps, pos - _ps));
+                for (auto& _ch : _sc) if (_ch == '\n' || _ch == '\r') _ch = ' ';
+                std::fprintf(stderr, "[struct-noname] ...<%s>|END\n", _sc.c_str());
+            }
             parse_struct_body(src, pos, td, std::string(name), pp, items, nss, file);
             items.push_back({std::move(td), pp.current_arch(), file});
             nss.insert(ns);
@@ -1688,6 +1746,12 @@ private:
 
         if (pos < src.size() && src[pos] == '{') {
             ++pos;
+            if (name.empty()) {
+                size_t _pe = pos > 140 ? pos - 140 : 0;
+                std::string _ec(src.substr(_pe, pos - _pe));
+                for (auto& _ch : _ec) if (_ch == '\n' || _ch == '\r') _ch = ' ';
+                std::fprintf(stderr, "[enum-noname] ...<%s>|END\n", _ec.c_str());
+            }
             std::string ns = map_ns(file);
             TDef td; td.kind = Kind::Enum; td.ns = ns; td.name = name; td.attr = TA::Pub;
             td.source_header = file;
@@ -1742,6 +1806,71 @@ private:
                 ++val;
             }
             if (pos < src.size() && src[pos] == '}') ++pos;
+            // Typedef alias list after the closing brace — mirror of
+            // parse_struct_body's recovery:
+            //     typedef enum _SID_NAME_USE { ... } SID_NAME_USE, *PSID_NAME_USE;
+            // The single-underscore TAG gets eaten by skip_decl_specifiers
+            // (annotation-shaped idents), leaving td.name empty; without
+            // scanning the tail the whole enum was dropped nameless
+            // (SID_NAME_USE, TOKEN_INFORMATION_CLASS, RPC_STATUS ... missing
+            // from the winmd) and the leaked `ALIAS, *PALIAS;` statement
+            // produced bogus field-less void* class rows instead. The first
+            // alias also names anonymous `typedef enum { ... } FOO;` enums.
+            auto emit_enum_tail_alias = [&](std::string_view alias, bool ptr_alias) {
+                if (alias.empty()) return;
+                if (td.name.empty()) td.name = std::string(alias);
+                if (std::string(alias) != td.name) {
+                    TDef ad; ad.kind = Kind::Class; ad.ns = td.ns; ad.name = std::string(alias);
+                    ad.attr = TA::Pub; ad.source_header = file;
+                    ad.alias_elem = ET::Class;
+                    ad.alias_ref.name = td.name;
+                    ad.alias_ref.elem = ET::Class;
+                    ad.alias_ref.ptr = ptr_alias ? 1u : 0u;
+                    items.push_back({std::move(ad), pp.current_arch(), file});
+                    nss.insert(td.ns);
+                }
+            };
+            {
+                size_t save = pos;
+                skip_ws(src, pos);
+                bool first_ptr = false;
+                for (int guard = 0; guard < 8; ++guard) {
+                    skip_ws(src, pos);
+                    bool progressed = false;
+                    for (auto const& dm : { "FAR", "NEAR", "__RPC_FAR", "far", "near" }) {
+                        if (match_w(src, pos, dm)) { pos += std::strlen(dm); skip_ws(src, pos); progressed = true; break; }
+                    }
+                    if (!progressed && pos < src.size() && src[pos] == '*') { first_ptr = true; ++pos; skip_ws(src, pos); progressed = true; }
+                    if (!progressed) break;
+                }
+                auto a1 = read_ident(src, pos);
+                // Only consume the first ident when it really is a tail alias:
+                // followed by ',' or ';' — an unrelated next token (e.g. a
+                // following declaration's keyword) must not be swallowed.
+                if (!a1.empty() && pos < src.size() && (src[pos] == ',' || src[pos] == ';'))
+                    emit_enum_tail_alias(a1, first_ptr);
+                else
+                    pos = save;
+            }
+            for (;;) {
+                skip_ws(src, pos);
+                if (pos >= src.size() || src[pos] != ',') break;
+                ++pos; skip_ws(src, pos);
+                bool ptr_alias = false;
+                for (int guard = 0; guard < 8; ++guard) {
+                    skip_ws(src, pos);
+                    bool progressed = false;
+                    for (auto const& dm : { "FAR", "NEAR", "__RPC_FAR", "far", "near" }) {
+                        if (match_w(src, pos, dm)) { pos += std::strlen(dm); skip_ws(src, pos); progressed = true; break; }
+                    }
+                    if (!progressed && pos < src.size() && src[pos] == '*') { ptr_alias = true; ++pos; skip_ws(src, pos); progressed = true; }
+                    if (!progressed) break;
+                }
+                auto alias = read_ident(src, pos);
+                if (alias.empty()) { skip_to_next_statement(src, pos); return; }
+                emit_enum_tail_alias(alias, ptr_alias);
+            }
+            skip_ws(src, pos);
             if (pos < src.size() && src[pos] == ';') ++pos;
             items.push_back({std::move(td), pp.current_arch(), file});
             nss.insert(ns);
@@ -1789,6 +1918,10 @@ private:
                 }
             }
         }
+        // Same WDK linkage-macro guard as parse_typedef: WDFAPI & friends
+        // between the (already consumed) annotations and the return type
+        // would otherwise become the return type itself.
+        skip_decl_specifiers(src, pos, true);
         auto ret = read_type(src, pos);
         skip_ws(src, pos);
         if (pos < src.size() && src[pos] == '(') ++pos;
@@ -1812,6 +1945,16 @@ private:
         td.attr = TA::Pub; td.is_callback = true;
         td.source_header = file;
         td.fn_class = std::move(fn_class);
+        {
+            static const std::set<std::string_view> sc2 = {
+                "ULONG", "UCHAR", "BYTE", "WCHAR", "byte", "ulong", "uchar", "ushort", "DWORD", "UINT", "LONG", "BOOL" };
+            if (sc2.count(name)) {
+                size_t _tp2 = pos > 160 ? pos - 160 : 0;
+                std::string _tc2(src.substr(_tp2, pos - _tp2));
+                for (auto& _ch : _tc2) if (_ch == '\n' || _ch == '\r') _ch = ' ';
+                std::fprintf(stderr, "[scalar-as-fnptr] <%s>|END\n", _tc2.c_str());
+            }
+        }
         MSig sig; sig.ret = ret.elem; sig.ret_r = std::move(ret.ref);
         sig.cc = CC::Def; sig.params = std::move(params);
         td.meths.push_back(std::move(sig));
@@ -2003,10 +2146,48 @@ private:
             skip_calling_convention(src, pos);
             skip_ws(src, pos);
         } else {
-            auto ret_r = read_type(src, pos);
-            ret = std::move(ret_r.ref);
-            if (pos == type_start) {
-                pos = saved; return false;
+            // Object-like type+cc macro whose real return type is INSIDE
+            // the macro definition (`STRSAFEAPI` = __inline HRESULT
+            // __stdcall, STRSAFEWORKERAPI = EXTERN_C HRESULT __stdcall,
+            // NTSTRSAFEAPI/STRSAFE_NTSVCAPI same shape). The check must
+            // run BEFORE read_type: read_type's named-type path
+            // unconditionally consumes the identifier as a bogus
+            // Class("STRSAFEAPI") return, so a post-read_type
+            // (pos == type_start) probe can never fire — every STRSAFE
+            // function returned void* (the unresolvable STRSAFEAPI
+            // class). Object-like: NO argument list follows (unlike
+            // WINOLEAPI_(type)); consume the token, substitute the
+            // macro's return type, then let skip_calling_convention
+            // clear __stdcall/__clrcall if spelled outside. This belongs
+            // in the FUNCTION parser, not read_type's conv_macros:
+            // skipping the macro there made read_type consume the
+            // FUNCTION NAME as the return type and the statement was
+            // dropped whole (empty Windows.Wdk.STRSAFE module).
+            static const std::unordered_map<std::string_view, std::string_view> ret_macros = {
+                {"STRSAFEAPI", "HRESULT"},
+                {"STRSAFEWORKERAPI", "HRESULT"},
+                {"STRSAFELOCALEWORKERAPI", "HRESULT"},
+                {"NTSTRSAFEAPI", "HRESULT"},
+                {"NTSTRSAFEAPI_", "HRESULT"},
+                {"STRSAFE_NTSVCAPI", "HRESULT"},
+            };
+            size_t mp = pos;
+            auto mid = read_ident(src, mp);
+            auto mit = ret_macros.find(mid);
+            if (mit != ret_macros.end()) {
+                pos = mp;
+                ret = TRef{};
+                ret.elem = ET::I4;
+                ret.name = std::string(mit->second);
+                skip_ws(src, pos);
+                skip_calling_convention(src, pos);
+                skip_ws(src, pos);
+            } else {
+                auto ret_r = read_type(src, pos);
+                ret = std::move(ret_r.ref);
+                if (pos == type_start) {
+                    pos = saved; return false;
+                }
             }
         }
 
@@ -2350,6 +2531,35 @@ private:
             size_t pstart = pos;
             skip_decl_specifiers(src, pos, true);
             auto sal_anns = sal.parse_all(src, pos);
+            // Annotations SalParser::classify does not know (_Always_(...),
+            // _In_range_(<=, N), _Deref_out_range_(...), _Printf_format_string_)
+            // stop parse_all with the cursor sitting ON the annotation. Left
+            // there, read_type consumed it as the parameter TYPE
+            // (Class("_Always_")), the param name came out empty, and the
+            // following '(' hit the empty-(void) marker -> skip_to_char(')')
+            // DROPPED THE REST OF THE PARAM LIST (StringCchCopyA collapsed
+            // to one `void* arg`, StringLengthWorkerA lost cchMax+pcchLength).
+            // Strip residual _-annotations here — same token shape the
+            // ret_start recovery strips — but only SAL spellings: a token
+            // that STARTS with '_', is followed by a letter, and ENDS with
+            // '_' (the SAL convention: _Always_, _Printf_format_string_).
+            // That rejects real types like __int64 (ends with a digit) so
+            // annotated typed params are never eaten.
+            for (int g = 0; g < 24; ++g) {
+                skip_ws(src, pos);
+                if (pos >= src.size() || src[pos] != '_') break;
+                size_t id_start = pos;
+                ++pos;
+                while (pos < src.size() &&
+                       (std::isalnum((unsigned char)src[pos]) || src[pos] == '_')) ++pos;
+                // id = _Foo_ (leading + trailing underscore, alpha after _)
+                bool sal_shape = (pos >= id_start + 3)
+                    && std::isalpha((unsigned char)src[id_start + 1])
+                    && src[pos - 1] == '_';
+                if (!sal_shape) { pos = id_start; break; }
+                skip_ws(src, pos);
+                if (pos < src.size() && src[pos] == '(') skip_balanced(src, pos, '(', ')');
+            }
             skip_ws(src, pos);
             auto pt = read_type(src, pos);
             // Fold declarator stars separated by no-op macros:
@@ -3203,6 +3413,34 @@ private:
                     "STDMETHODVCALLTYPE","__cdecl","__stdcall","__fastcall","__thiscall",
                     "WINBASEAPI","WINUSERAPI","WINGDIAPI","WINMMAPI","WINADVAPI",
                     "WINHTTPAPI","WININETAPI","WINSOCK_API_LINKAGE","WINSOCK2_API",
+                    // WDK API-linkage macros that prefix function / callback
+                    // typedefs: left unconsumed, read_type swallowed them as
+                    // the RETURN TYPE and the real return type became the
+                    // declared NAME — `typedef WDFAPI ULONG (NTAPI *PFN_X)(...)`
+                    // produced a bogus delegate named ULONG (ret=WDFAPI->void*,
+                    // `using ULONG = void*(__stdcall*)();` in every WDK module).
+                    "WDFAPI","NTKERNELAPI","NTSYSAPI","NTSYSCALLAPI","FLTAPI",
+                    "NTHALAPI","VIDEOPORT_API","STORPORT_API","SCSIPORT_API",
+                    "CLFSUSER_API","PORTCLASSAPI",
+                    // UM/shared API-linkage family (same name-shift hazard:
+                    // `typedef WINCRYPT32API BOOL (WINAPI *PFN_X)(...)` made
+                    // BOOL the declared NAME). Also __callback, which the
+                    // `_`-annotation path misses (isalpha('_') is false).
+                    // ONLY linkage-only macros: STDAPI/BOOLAPI/SNMPAPI/DWMAPI/
+                    // THEMEAPI/URLCACHEAPI/VERSIONHELPERAPI/STRSAFEAPI/
+                    // STRSAFEWORKERAPI/WINOLEAPI/NETIOAPI_API expand to a
+                    // TYPE + cc (`STDAPI` = EXTERN_C HRESULT ...) — in raw
+                    // text `MACRO Fn(...)` the type is INSIDE the macro, so
+                    // consuming the macro would eat the function NAME.
+                    "RPCRTAPI","IMAGEAPI","WINSETUPAPI","CMAPI",
+                    "WINCRYPT32API","KSDDKAPI","ENGAPI","TSPIAPI","WSAAPI",
+                    "NTDSAPI","WINFAXAPI",
+                    "WSPAPI","WMIAPI","USERENVAPI",
+                    "WDSCLIAPI","VFWAPI","AUTHZAPI","PXEAPI",
+                    "PATCHAPI","DSGETDCAPI","WINPATHCCHAPI","CERTBCLI_API",
+                    "CREDUIAPI","WDSTCIAPI","AVRTAPI",
+                    "WDSTRANSPORTPROVIDERAPI","EVNTAPI","BATTERYCLASSAPI","WINSTORAGEAPI",
+                    "__callback",
                     "SHSTDAPI","SHDOCAPI","COMMCTRLAPI","SCARDAPI","WINSCARDAPI",
                     "OLEDBAPI","WINOLEAUTAPI","WINPRIVAPI","OBJECTAPI","ROAPI",
                 };
@@ -3476,12 +3714,16 @@ private:
             {"KMDF","Windows.Wdk.Kmdf"},
             {"UMDF","Windows.Wdk.Umdf"},
         };
-        auto it = ns_map.find(stem_lower);
-        if (it != ns_map.end()) return it->second;
         // Generic -ns override wins over both the table and the fallback:
-        // any header on earth can be pinned to any namespace by the caller.
+        // any header on earth — including a future SDK header the built-in
+        // table already claims — can be pinned to any namespace by the
+        // caller. Consulted FIRST (README: "overrides the built-in table");
+        // the previous table-first order silently ignored user pins for any
+        // stem already present in ns_map.
         if (auto ov = st.ns_overrides.find(stem_lower); ov != st.ns_overrides.end())
             return ov->second;
+        auto it = ns_map.find(stem_lower);
+        if (it != ns_map.end()) return it->second;
         // NuGet/extra include dirs: header stem becomes the leaf segment
         // under the dir's registered namespace root (no table entry needed).
         if (!st.extra_include_ns.empty())
@@ -3560,14 +3802,21 @@ private:
                 }
             }
         }
-        // Unmapped headers follow the DIRECTORY they came from: km/ and
-        // the WDK's wdf/ framework trees are kernel-side (Windows.Wdk.*),
-        // everything else (um/, shared/, winrt/, extra -include_dir) is
-        // user-mode (Windows.Win32.*). The old rule keyed off
-        // st.include_drivers, which misbucketed hundreds of unmapped um/
-        // headers (appmodel.h -> Windows.Wdk.APPMODEL) as soon as driver
-        // parsing was enabled.
+        // Unmapped headers follow the DIRECTORY they came from: km/,
+        // shared/ and the WDK's wdf/ framework trees are WDK surface
+        // (Windows.Wdk.*), um/, winrt/ and extra -include_dir are
+        // user-mode (Windows.Win32.*). shared/ must bucket with Wdk in
+        // the COMBINED (-include_drivers) build too: -drivers_only parses
+        // km/+shared/+wdf/ exclusively, so every unmapped header there is
+        // Windows.Wdk.* — pinning shared/ the same way in the combined
+        // build keeps both winmds namespace-identical (shared/basetsd.h
+        // -> Windows.Wdk.BASETSD regardless of mode). The um/ misbucket
+        // of the old include_drivers rule (appmodel.h -> Windows.Wdk.
+        // APPMODEL) stays fixed: um/ never maps to Wdk.
+        bool is_shared_header = filepath.find("\\shared\\") != std::string::npos
+            || filepath.find("/shared/") != std::string::npos;
         bool is_kernel_header = st.drivers_only
+            || is_shared_header
             || filepath.find("\\km\\") != std::string::npos
             || filepath.find("/km/") != std::string::npos
             || filepath.find("\\wdf\\") != std::string::npos

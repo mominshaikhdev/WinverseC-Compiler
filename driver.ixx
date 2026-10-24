@@ -13,6 +13,7 @@ module;
 
 export module winversec.driver;
 import winversec.types;
+import winversec.attributes;
 
 export namespace wv {
 
@@ -690,9 +691,43 @@ public:
                 }
             }
 
-            // Fallback: if from WDK namespace and still unmapped, default to ntoskrnl.exe
-            if (!mapped && it.def.ns.starts_with("Windows.Wdk.")) {
+            // Data-driven fallback: the SDK km import-lib scan (symbol ->
+            // "<lib>.lib", populated at startup in main). A FUTURE kernel API
+            // from a brand-new driver library with no prefix rule yet resolves
+            // to the library that actually exports it instead of the blanket
+            // guess below — pure RUN-time data, so a WDK growth spurt never
+            // needs a winversec table edit or rebuild.
+            if (!mapped) {
+                auto kit = st.km_lib_imports.find(it.def.name);
+                if (kit != st.km_lib_imports.end()) {
+                    it.def.import_library = kit->second;
+                    mapped = true;
+                }
+            }
+
+            // Fallback: kernel-namespace functions still unmapped default to
+            // ntoskrnl.exe. Windows.Win32.Kernel.* is kernel-mode surface too
+            // — the same rule cppwinc uses to pick the projection model.
+            if (!mapped && (it.def.ns.starts_with("Windows.Wdk.") ||
+                            it.def.ns.starts_with("Windows.Win32.Kernel"))) {
                 it.def.import_library = "ntoskrnl.exe";
+                mapped = true;
+            }
+
+            // Publish whatever THIS pass mapped. The Winverse
+            // ImportLibrary/DllImport/ExportFunction attributes are the only
+            // channel cppwinc reads (its winmd reader has no ModuleRef
+            // fallback), so a mapping that skips them is invisible downstream
+            // and the consumer link dies LNK2019. Until now every mapping
+            // made here was silently dropped for exactly that reason.
+            if (mapped) {
+                if (it.def.entry_point.empty()) it.def.entry_point = it.def.name;
+                it.def.attributes.push_back(attr::make_import_library({
+                    .dll = it.def.import_library,
+                    .entry_point = it.def.name,
+                }));
+                it.def.attributes.push_back(attr::make_dll_import(it.def.import_library));
+                it.def.attributes.push_back(attr::make_export_function(it.def.name));
             }
         }
     }

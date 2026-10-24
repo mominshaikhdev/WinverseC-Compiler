@@ -301,6 +301,16 @@ private:
         // other annotation, no buffer semantics attached.
         if (name.starts_with("Post_") || name.starts_with("Pre_"))
             return SalKind::Federated;
+        // _Return_type_success_(expr) / _Return_type_failure_(expr): winnt.h
+        // declares `typedef _Return_type_success_(return >= 0) long HRESULT;`
+        // — the annotation sits BETWEEN `typedef` and the type. Unclassified,
+        // parse_all stopped, read_type read _Return_type_success_ as the TYPE
+        // name, `long` hit the C++ keyword guard, and the entire typedef was
+        // DROPPED — no HRESULT alias row, no AliasTarget, so every projection
+        // emitted `using HRESULT = void*;` instead of std::int32_t. Federated
+        // (inert marker) is correct: no buffer semantics, just skipped.
+        if (name.starts_with("Return_type_success") || name.starts_with("Return_type_failure"))
+            return SalKind::Federated;
         if (name.starts_with("IRQL_"))         return SalKind::Irql;
         return SalKind::None;
     }

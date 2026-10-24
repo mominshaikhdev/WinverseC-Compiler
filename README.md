@@ -253,27 +253,39 @@ let file = CreateFileW(w!("data.txt"), GENERIC_READ, FILE_SHARE_READ,
 
 #### C++23 Modules / CppWinC
 ```cpp
+import std;
 import Windows.Win32.Storage.FileSystem;
+import Windows.Win32.System;
+import Windows.Win32.Foundation;
+import Windows.Win32.UI.WindowsAndMessaging;
 using namespace Windows::Win32::Storage::FileSystem;
+using namespace Windows::Win32::System::SystemServices;
+using namespace Windows::Win32::UI::WindowsAndMessaging;
 
-auto file = CreateFileW(L"data.txt", GENERIC_READ, FILE_SHARE_READ,
+// Handles flatten to void*; Win32 constants project as inline constexpr
+// values in their metadata namespaces (GENERIC_READ, OPEN_EXISTING, ...).
+void* file = CreateFile(L"data.txt", GENERIC_READ, FILE_SHARE_READ,
     nullptr, OPEN_EXISTING, 0, nullptr);
 
 char buf[4096]{};
-DWORD bytesRead = 0;
-ReadFile(file.get(), buf, sizeof(buf), &bytesRead, nullptr);
+std::uint32_t bytesRead = 0;
+ReadFile(file, buf, sizeof(buf), &bytesRead, nullptr);
+Windows::Win32::Foundation::CloseHandle(file);
 
-auto hwnd = CreateWindowExW(0, L"MyApp", L"Hello",
-    WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 800, 600,
-    nullptr, nullptr, GetModuleHandle(nullptr), nullptr);
+// CreateFile/CreateWindowEx are the unsuffixed canonicals cppwinc emits
+// for each CreateFileW/CreateWindowExW pair; string parameters take
+// wchar_t const* directly.
+void* hwnd = CreateWindowEx(WS_EX_OVERLAPPEDWINDOW, L"MyApp", L"Hello",
+    WS_OVERLAPPEDWINDOW, static_cast<std::int32_t>(CW_USEDEFAULT),
+    static_cast<std::int32_t>(CW_USEDEFAULT), 800, 600, nullptr, nullptr, nullptr, nullptr);
 ```
 
 #### TypeScript / TSWinC
 ```typescript
-import { CreateFileW, ReadFile, GENERIC_READ } from "Windows.Win32.FileSystem";
+import { CreateFileW, ReadFile, GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING } from "Windows.Win32.FileSystem";
 import { CreateWindowExW, WS_OVERLAPPED, WS_VISIBLE } from "Windows.Win32.UI.WindowsAndMessaging";
 
-const file = CreateFileW("data.txt", GENERIC_READ, 1, null, 3, 0, null);
+const file = CreateFileW("data.txt", GENERIC_READ, FILE_SHARE_READ, null, OPEN_EXISTING, 0, null);
 const buf = new ArrayBuffer(4096);
 const bytesRead = new Uint32Array(1);
 ReadFile(file, buf, buf.byteLength, bytesRead, null);
@@ -284,10 +296,10 @@ const hwnd = CreateWindowExW(0, "MyApp", "Hello", WS_OVERLAPPED | WS_VISIBLE, 0,
 #### Python / PyWinC
 ```python
 import ctypes
-from Windows.Win32.FileSystem import CreateFileW, ReadFile, GENERIC_READ
+from Windows.Win32.FileSystem import CreateFileW, ReadFile, GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING
 from Windows.Win32.UI.WindowsAndMessaging import CreateWindowExW, WS_OVERLAPPED, WS_VISIBLE
 
-file = CreateFileW("data.txt", GENERIC_READ, 1, None, 3, 0, None)
+file = CreateFileW("data.txt", GENERIC_READ, FILE_SHARE_READ, None, OPEN_EXISTING, 0, None)
 buf = ctypes.create_string_buffer(4096)
 bytes_read = ctypes.c_ulong(0)
 ReadFile(file, buf, 4096, ctypes.byref(bytes_read), None)
@@ -304,23 +316,30 @@ Using `Windows.Win32+Wdk.winmd` (generated with `-include_drivers`), both `Windo
 #### C++ — Combined Win32 + WDK (CppWinC)
 
 ```cpp
+import std;
 import Windows.Win32.Storage.FileSystem;
-import Windows.Win32.UI.WindowsAndMessaging;
+import Windows.Win32.System;
+import Windows.Win32.Foundation;
 import Windows.Wdk.BASETSD;
 import Windows.Wdk.STRSAFE;
+using namespace Windows::Win32::Storage::FileSystem;
+using namespace Windows::Win32::System::SystemServices;
 
-// Win32: user-mode API
-auto file = Windows::Win32::Storage::FileSystem::CreateFileW(L"data.txt", GENERIC_READ,
-    FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+// Win32: user-mode API (canonical CreateFile forwards to CreateFileW)
+void* file = CreateFile(L"data.txt", GENERIC_READ, FILE_SHARE_READ,
+    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+Windows::Win32::Foundation::CloseHandle(file);
 
 // WDK: type-safe integer conversions
-void* handle = /* ... */;
-int32_t value = Windows::Wdk::BASETSD::HandleToLong(handle);
+void* handle = nullptr;
+std::int32_t value = Windows::Wdk::BASETSD::HandleToLong(handle);
 void* restored = Windows::Wdk::BASETSD::LongToHandle(value);
 
-// WDK: string safety helpers
-char dest[256]{};
-Windows::Wdk::STRSAFE::StringCbCopy(dest, sizeof(dest), "Hello");
+// WDK: string safety helpers (the A/W canonical takes the W signature:
+// destination, size, mutable source)
+wchar_t dest[256]{};
+wchar_t src[] = L"Hello";
+Windows::Wdk::STRSAFE::StringCbCopy(dest, sizeof(dest), src);
 ```
 
 #### Rust — Combined Win32 + WDK (windows-rs)
@@ -349,11 +368,11 @@ unsafe {
 
 ```python
 import ctypes
-from Windows.Win32.FileSystem import CreateFileW, ReadFile, GENERIC_READ
+from Windows.Win32.FileSystem import CreateFileW, ReadFile, GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING
 from Windows.Wdk.Basetsd import HandleToLong, LongToHandle, PtrToInt, IntToPtr
 
 # Win32: user-mode API
-file = CreateFileW("data.txt", GENERIC_READ, 1, None, 3, 0, None)
+file = CreateFileW("data.txt", GENERIC_READ, FILE_SHARE_READ, None, OPEN_EXISTING, 0, None)
 
 # WDK: type-safe integer conversions
 handle = get_handle()  # some HANDLE

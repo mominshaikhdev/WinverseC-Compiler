@@ -160,8 +160,13 @@ static void usage() {
 // (symbols before the dll name), so symbols accumulate until a
 // "<name>.dll" string appears, then bind to it; __IMPORT_DESCRIPTOR_<X>
 // supplies the fallback. Handles multi-dll umbrella libs.
+// When fixed_value is non-empty it is recorded instead of the descriptor's
+// dll name — the SDK scan passes the LIB FILE name ("kernel32.lib") because
+// that is what the downstream linker consumes; descriptor DLLs are often
+// api-set shims (api-ms-win-*.dll) whose .lib does not exist on disk.
 static void scan_import_lib(const std::filesystem::path& lib,
-                            std::unordered_map<std::string, std::string>& out)
+                            std::unordered_map<std::string, std::string>& out,
+                            std::string const& fixed_value = {})
 {
     std::error_code ec;
     auto sz = std::filesystem::file_size(lib, ec);
@@ -176,9 +181,10 @@ static void scan_import_lib(const std::filesystem::path& lib,
     std::string cur_dll;
     std::string fallback_dll;
     auto flush = [&](std::string const& dll) {
-        if (dll.empty()) return;
+        std::string const& value = !fixed_value.empty() ? fixed_value : dll;
+        if (value.empty()) return;
         for (auto& s : pend)
-            if (!out.contains(s)) out.emplace(s, dll);
+            if (!out.contains(s)) out.emplace(s, value);
         pend.clear();
     };
     auto is_ident = [](std::string const& s) {
@@ -423,6 +429,48 @@ int main(int argc, char* argv[]) {
                 break;  // first (highest-precedence) arch present wins
             }
         }
+    }
+    // Automatic Windows SDK import-lib discovery: scan the SDK's own import
+    // libraries (um + ucrt for user mode, km for kernel mode) and record
+    // symbol -> "<lib file>.lib". The curated dll_map_ table necessarily
+    // lags every new Windows release; this scan is the data-driven fallback
+    // that makes FUTURE SDK/WDK APIs resolve to a linkable library with no
+    // winversec table edit or rebuild — the DLL-mapping counterpart of the
+    // directory-fallback namespace rule (new surface just works). Sorted
+    // scan order keeps first-wins resolution deterministic across machines.
+    {
+        namespace fs3 = std::filesystem;
+        auto scan_dir = [&](fs3::path const& dir, auto& map, char const* tag)
+        {
+            std::error_code ec;
+            if (!fs3::is_directory(dir, ec)) return;
+            std::vector<fs3::path> libs;
+            for (auto const& e : fs3::directory_iterator(dir, ec))
+            {
+                if (!e.is_regular_file(ec)) continue;
+                // Case-insensitive: the SDK ships both spellings
+                // (rpcrt4.lib AND RpcRT4.Lib) and a case-sensitive
+                // comparison silently skipped the CamelCase ones — taking
+                // their symbols' attribution away entirely.
+                std::string ext = e.path().extension().string();
+                for (auto& c : ext) c = (char)std::tolower((unsigned char)c);
+                if (ext == ".lib") libs.push_back(e.path());
+            }
+            std::sort(libs.begin(), libs.end());
+            for (auto const& p : libs)
+                scan_import_lib(p, map, p.filename().string());
+            if (verbose)
+                std::cout << "scanned SDK " << tag << " libs: " << libs.size()
+                          << " files, " << map.size() << " symbols\n";
+        };
+        fs3::path lib_root = fs3::path(sdk) / "Lib" / version_dir;
+        if (!drivers_only)
+        {
+            scan_dir(lib_root / "um" / "x64", state.sdk_lib_imports, "um");
+            scan_dir(lib_root / "ucrt" / "x64", state.sdk_lib_imports, "ucrt");
+        }
+        if (drivers)
+            scan_dir(lib_root / "km" / "x64", state.km_lib_imports, "km");
     }
     // -ns <header=Namespace>: pin any header's items to any namespace.
     // Header stem is lowercased for matching; namespace is taken verbatim

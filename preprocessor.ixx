@@ -95,18 +95,164 @@ public:
     // decimal) or the name of a previously defined object macro. Resolves
     // one level of macro indirection recursively (FILE_DEVICE_DISK ->
     // 0x00000007).
-    bool eval_macro_int(std::string_view s, uint32_t& out) const {
+    // Evaluate an integer #define value: literals (hex/dec with suffixes),
+    // referenced defines, redundant parentheses, type casts (with optional
+    // inner spaces), unary +/~/-, and the top-level binary operators |, ^,
+    // &, << and >> — SDK headers spell constant families as
+    // (WS_OVERLAPPED|WS_CAPTION|...), registry access masks as
+    // (STANDARD_RIGHTS_READ | KEY_QUERY_VALUE | KEY_NOTIFY), the predefined
+    // HKEY_* roots as (( HKEY ) ( ((ULONG_PTR)((LONG)0x80000000)) )) and
+    // INVALID_HANDLE_VALUE as ((HANDLE)(LONG_PTR)-1). A literal-or-
+    // identifier-only evaluator dropped every one of them.
+    static void eval_trim(std::string_view& s) {
         while (!s.empty() && (unsigned char)s.front() <= ' ') s.remove_prefix(1);
         while (!s.empty() && (unsigned char)s.back() <= ' ') s.remove_suffix(1);
+    }
+    // Split at the LAST top-level occurrence of a single-char operator
+    // (rightmost split => left-associative evaluation through recursion).
+    static bool eval_split1(std::string_view s, char op,
+                            std::string_view& lhs, std::string_view& rhs) {
+        int depth = 0;
+        for (size_t i = s.size(); i-- > 0;) {
+            char c = s[i];
+            if (c == ')') ++depth;
+            else if (c == '(') { if (--depth < 0) return false; }
+            else if (c == op && depth == 0) {
+                lhs = s.substr(0, i);
+                rhs = s.substr(i + 1);
+                eval_trim(lhs);
+                eval_trim(rhs);
+                return !lhs.empty() && !rhs.empty();
+            }
+        }
+        return false;
+    }
+    // Same for a two-char operator (<<, >>).
+    static bool eval_split2(std::string_view s, char a, char b,
+                            std::string_view& lhs, std::string_view& rhs) {
+        int depth = 0;
+        for (size_t i = s.size(); i-- > 0;) {
+            char c = s[i];
+            if (c == ')') ++depth;
+            else if (c == '(') { if (--depth < 0) return false; }
+            else if (c == b && i > 0 && s[i - 1] == a && depth == 0) {
+                lhs = s.substr(0, i - 1);
+                rhs = s.substr(i + 1);
+                eval_trim(lhs);
+                eval_trim(rhs);
+                return !lhs.empty() && !rhs.empty();
+            }
+        }
+        return false;
+    }
+    bool eval_or(std::string_view s, uint32_t& out) const {
+        std::string_view lhs, rhs;
+        if (eval_split1(s, '|', lhs, rhs)) {
+            uint32_t a = 0, b = 0;
+            return eval_or(lhs, a) && eval_or(rhs, b) && ((out = a | b), true);
+        }
+        return eval_xor(s, out);
+    }
+    bool eval_xor(std::string_view s, uint32_t& out) const {
+        std::string_view lhs, rhs;
+        if (eval_split1(s, '^', lhs, rhs)) {
+            uint32_t a = 0, b = 0;
+            return eval_xor(lhs, a) && eval_xor(rhs, b) && ((out = a ^ b), true);
+        }
+        return eval_and(s, out);
+    }
+    bool eval_and(std::string_view s, uint32_t& out) const {
+        std::string_view lhs, rhs;
+        if (eval_split1(s, '&', lhs, rhs)) {
+            uint32_t a = 0, b = 0;
+            return eval_and(lhs, a) && eval_and(rhs, b) && ((out = a & b), true);
+        }
+        return eval_shift(s, out);
+    }
+    bool eval_shift(std::string_view s, uint32_t& out) const {
+        std::string_view lhs, rhs;
+        if (eval_split2(s, '<', '<', lhs, rhs)) {
+            uint32_t a = 0, b = 0;
+            return eval_shift(lhs, a) && eval_primary(rhs, b) && ((out = a << b), true);
+        }
+        if (eval_split2(s, '>', '>', lhs, rhs)) {
+            uint32_t a = 0, b = 0;
+            return eval_shift(lhs, a) && eval_primary(rhs, b) && ((out = a >> b), true);
+        }
+        return eval_primary(s, out);
+    }
+    bool eval_primary(std::string_view s, uint32_t& out) const {
+        eval_trim(s);
         if (s.empty()) return false;
+        // Unwrap redundant parentheses: "(0x10)" -> "0x10",
+        // "(WS_OVERLAPPED|WS_CAPTION|...)" -> "WS_OVERLAPPED|WS_CAPTION|...".
+        bool unwrapped = false;
+        while (s.size() >= 2 && s.front() == '(' && s.back() == ')') {
+            int depth = 0;
+            bool whole = true;
+            for (size_t i = 0; i < s.size(); ++i) {
+                if (s[i] == '(') ++depth;
+                else if (s[i] == ')') {
+                    --depth;
+                    if (depth == 0 && i + 1 < s.size()) { whole = false; break; }
+                }
+            }
+            if (!whole) break;
+            s = s.substr(1, s.size() - 2);
+            eval_trim(s);
+            unwrapped = true;
+        }
+        // A fully parenthesized VALUE like (A|B|C) unwraps to an expression,
+        // not an atom — re-dispatch so its top-level operators split. (A
+        // non-unwrapping cast chain like ( HKEY ) (0x1) never sets the flag,
+        // so the cast-strip below still runs for it.)
+        if (unwrapped) return eval_or(s, out);
+        // Strip a leading type cast — "(HKEY)" / "( HKEY )" / "(ULONG_PTR)"
+        // — when a value follows: evaluate that inner value instead.
+        if (s.size() > 2 && s.front() == '(') {
+            size_t i = 1;
+            while (i < s.size() && (unsigned char)s[i] <= ' ') ++i;
+            size_t id_start = i;
+            while (i < s.size() && (std::isalnum((unsigned char)s[i]) || s[i] == '_')) ++i;
+            if (i > id_start) {
+                while (i < s.size() && (unsigned char)s[i] <= ' ') ++i;
+                if (i < s.size() && s[i] == ')') {
+                    auto rest = s.substr(i + 1);
+                    eval_trim(rest);
+                    if (!rest.empty() && (rest.front() == '(' || rest.front() == '-' ||
+                                          rest.front() == '+' || rest.front() == '~' ||
+                                          std::isalnum((unsigned char)rest.front()) ||
+                                          rest.front() == '_'))
+                        return eval_or(rest, out);
+                }
+            }
+        }
+        // Unary minus / plus / complement.
+        if (s.front() == '-' || s.front() == '+' || s.front() == '~') {
+            char op = s.front();
+            uint32_t v = 0;
+            if (!eval_primary(s.substr(1), v)) return false;
+            out = (op == '-') ? (uint32_t)(0u - v) : (op == '~') ? (uint32_t)~v : v;
+            return true;
+        }
         if (std::isdigit((unsigned char)s.front())) {
             out = (uint32_t)std::strtoul(std::string(s).c_str(), nullptr, 0);
             return true;
         }
         auto it = defines_.find(std::string(s));
         if (it != defines_.end() && it->second.value != s)
-            return eval_macro_int(it->second.value, out);
+            return eval_macro_int(it->second.value, out); // capped entry
         return false;
+    }
+    bool eval_macro_int(std::string_view s, uint32_t& out) const {
+        // Recursion cap: the merged post-parse define table contains
+        // mutual references; 64 frames is far beyond any real constant
+        // chain (the longest observed WS_*/DSBCAPS_* nests use <10).
+        thread_local int eval_depth = 0;
+        if (eval_depth > 64) return false;
+        struct depth_guard { int& d; ~depth_guard() { --d; } } g{ eval_depth };
+        ++eval_depth;
+        return eval_or(s, out);
     }
 
     // Evaluate CTL_CODE(DeviceType, Function, Method, Access) into its
@@ -1288,6 +1434,14 @@ public:
         set_define("_CPPUNWIND");
         set_define("_MSC_VER", "1900");
         set_define("_WIN32");
+        // rpc.h defines this unconditionally in real builds. Per-header parse
+        // isolation means rpcdce.h never sees that #define, so it fell into
+        // its #else branch: the phantom unsuffixed TCHAR-generic decls
+        // (RpcBindingFromStringBinding) that RpcRT4.Lib does NOT export
+        // (only ...A/...W) — names that could never get an import-lib
+        // attribution or link. With this defined, the A/W decls are parsed
+        // and match the actual exports exactly.
+        set_define("RPC_UNICODE_SUPPORTED");
         set_define("_INTEGRAL_MAX_BITS", "64");
         set_define("__STDC__", "1");
         set_define("__STDC_VERSION__", "202311L");
