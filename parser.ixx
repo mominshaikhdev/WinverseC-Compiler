@@ -875,6 +875,50 @@ private:
             // by a higher version check (threadpoolapiset's `#if (_WIN32_WINNT >= 0x0600)`).
             if (!active) return;
             auto after = tr(t.substr(6));
+            // Function-like macro: `#define NAME(a, b) body`. The '(' is
+            // glued to the name with no whitespace, so the object-like
+            // split below would record "_HRESULT_TYPEDEF_(_sc)" as the
+            // macro NAME - an unresolvable pseudo-name. Every constant
+            // built through such a macro then failed to evaluate and was
+            // silently dropped from the winmd (all E_* HRESULTs go through
+            // _HRESULT_TYPEDEF_, which is why E_FAIL/E_BOUNDS/
+            // E_CHANGED_STATE/E_ILLEGAL_METHOD_CALL were missing). Record
+            // the parameter names instead so invocations can be expanded.
+            {
+                size_t ni = 0;
+                while (ni < after.size() &&
+                       (std::isalnum((unsigned char)after[ni]) || after[ni] == '_')) ++ni;
+                if (ni > 0 && ni < after.size() && after[ni] == '(') {
+                    auto close = after.find(')', ni);
+                    if (close != std::string_view::npos) {
+                        std::vector<std::string> mparams;
+                        auto plist = after.substr(ni + 1, close - ni - 1);
+                        size_t ps = 0;
+                        while (ps <= plist.size()) {
+                            auto comma = plist.find(',', ps);
+                            auto piece = plist.substr(ps,
+                                comma == std::string_view::npos ? std::string_view::npos
+                                                                : comma - ps);
+                            auto pname = tr(piece);
+                            if (!pname.empty()) mparams.emplace_back(pname);
+                            if (comma == std::string_view::npos) break;
+                            ps = comma + 1;
+                        }
+                        std::string mbody(after.substr(close + 1));
+                        std::string mname(after.substr(0, ni));
+                        mbody = std::string(tr(mbody));
+                        // Also record globally: the merged evaluation table
+                        // is rebuilt in the enricher from State, and a copy
+                        // of this preprocessor cannot carry the macro there.
+                        {
+                            std::lock_guard<std::mutex> lk(g_define_record_mtx);
+                            pp.st.func_macros.push_back({ mname, mparams, mbody });
+                        }
+                        pp.set_function_macro(mname, std::move(mparams), mbody);
+                        return;
+                    }
+                }
+            }
             // Split name/value at the first WHITESPACE, not just ' '. SDK
             // headers use tab-separated defines with trailing comments
             // (`#define ICW_MAX_PASSWORD\t256\t// PWLEN`): find(' ') walked

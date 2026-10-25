@@ -299,6 +299,18 @@ struct IntConst {
     std::string value_text;
 };
 
+// Function-like #define (`#define NAME(a, b) body`). Recorded globally
+// because the merged evaluation table is rebuilt in the enricher from
+// st.int_consts alone: without this the macro name exists only in the
+// per-file preprocessor copy that saw it, so any constant built through
+// one (every E_* HRESULT goes via _HRESULT_TYPEDEF_) evaluated to nothing
+// and was silently dropped from the winmd.
+struct FuncMacro {
+    std::string name;
+    std::vector<std::string> params;
+    std::string value_text;
+};
+
 struct State {
     std::vector<Item> items;
     std::vector<IoctlConst> ioctl_consts;
@@ -308,6 +320,8 @@ struct State {
     std::vector<IoctlConst> irp_mj_consts;
     // General numeric #define constants — see IntConst above.
     std::vector<IntConst> int_consts;
+    // Function-like #define macros — see FuncMacro above.
+    std::vector<FuncMacro> func_macros;
     std::set<std::string> nss;
     std::string asm_name = "Windows.Win32";
     std::string asm_ver = "26100.0.0";

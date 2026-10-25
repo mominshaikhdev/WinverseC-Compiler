@@ -91,6 +91,24 @@ public:
         defines_[name] = {name, value};
     }
 
+    // Set a function-like macro, keeping its parameter names so the integer
+    // evaluator can expand invocations. The SDK builds whole constant
+    // families through these: every E_* HRESULT is
+    // `#define E_FAIL _HRESULT_TYPEDEF_(0x80004005L)` where
+    // `_HRESULT_TYPEDEF_(_sc) ((HRESULT)_sc)`. Recording the name alone
+    // (with its parameter list still glued to it) left the invocation
+    // unresolvable, so the constant was dropped from the winmd.
+    void set_function_macro(const std::string& name,
+                            std::vector<std::string> params,
+                            const std::string& value) {
+        Define d;
+        d.name = name;
+        d.value = value;
+        d.is_function_macro = true;
+        d.params = std::move(params);
+        defines_[name] = std::move(d);
+    }
+
     // Evaluate an integer expression fragment: a numeric literal (0x... /
     // decimal) or the name of a previously defined object macro. Resolves
     // one level of macro indirection recursively (FILE_DEVICE_DISK ->
@@ -107,6 +125,32 @@ public:
     static void eval_trim(std::string_view& s) {
         while (!s.empty() && (unsigned char)s.front() <= ' ') s.remove_prefix(1);
         while (!s.empty() && (unsigned char)s.back() <= ' ') s.remove_suffix(1);
+    }
+    static void eval_trim(std::string& s) {
+        while (!s.empty() && (unsigned char)s.front() <= ' ') s.erase(0, 1);
+        while (!s.empty() && (unsigned char)s.back() <= ' ') s.pop_back();
+    }
+    // Whole-word replacement of a macro parameter inside a macro body.
+    // `_sc` must not corrupt a longer identifier that merely starts with it
+    // (`_sc2`, `m_scx`), so both flanking characters are checked.
+    static std::string replace_word(std::string body, std::string const& word,
+                                    std::string const& repl) {
+        if (word.empty()) return body;
+        size_t pos = 0;
+        while ((pos = body.find(word, pos)) != std::string::npos) {
+            bool left_ok  = (pos == 0) ||
+                !(std::isalnum((unsigned char)body[pos - 1]) || body[pos - 1] == '_');
+            size_t end = pos + word.size();
+            bool right_ok = (end >= body.size()) ||
+                !(std::isalnum((unsigned char)body[end]) || body[end] == '_');
+            if (left_ok && right_ok) {
+                body.replace(pos, word.size(), repl);
+                pos += repl.size();
+            } else {
+                pos += word.size();
+            }
+        }
+        return body;
     }
     // Split at the LAST top-level occurrence of a single-char operator
     // (rightmost split => left-associative evaluation through recursion).
@@ -280,6 +324,50 @@ public:
         if (std::isdigit((unsigned char)s.front())) {
             out = (uint32_t)std::strtoul(std::string(s).c_str(), nullptr, 0);
             return true;
+        }
+        // Function-like macro invocation: `NAME(arg, ...)`. The SDK builds
+        // constant families this way - every E_* HRESULT is
+        // `_HRESULT_TYPEDEF_(0x80004005L)`, and CTL_CODE packs IOCTLs. The
+        // identifier is glued to '(', so the object-like lookup below can
+        // never match it; substitute the arguments into the body and
+        // evaluate that instead. Argument substitution is whole-word so a
+        // parameter named `_sc` cannot corrupt a longer identifier.
+        {
+            size_t i = 0;
+            while (i < s.size() && (std::isalnum((unsigned char)s[i]) || s[i] == '_')) ++i;
+            if (i > 0 && i < s.size() && s[i] == '(') {
+                auto it = defines_.find(std::string(s.substr(0, i)));
+                if (it != defines_.end() && it->second.is_function_macro) {
+                    // Split the argument list on top-level commas.
+                    std::vector<std::string_view> args;
+                    int depth = 0;
+                    size_t start = i + 1;
+                    for (size_t k = i + 1; k < s.size(); ++k) {
+                        char c = s[k];
+                        if (c == '(') ++depth;
+                        else if (c == ')') {
+                            if (depth == 0) {
+                                args.push_back(s.substr(start, k - start));
+                                break;
+                            }
+                            --depth;
+                        }
+                        else if (c == ',' && depth == 0) {
+                            args.push_back(s.substr(start, k - start));
+                            start = k + 1;
+                        }
+                    }
+                    if (args.size() == it->second.params.size()) {
+                        std::string body = it->second.value;
+                        for (size_t p = 0; p < args.size(); ++p) {
+                            std::string arg(args[p]);
+                            eval_trim(arg);
+                            body = replace_word(std::move(body), it->second.params[p], arg);
+                        }
+                        return eval_or(body, out);
+                    }
+                }
+            }
         }
         auto it = defines_.find(std::string(s));
         if (it != defines_.end() && it->second.value != s)

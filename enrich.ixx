@@ -162,6 +162,18 @@ inline void Enricher::materialize_int_consts()
                 std::fprintf(stderr, "[int_consts] table %s = '%s' (from %s)\n", ic.name.c_str(), ic.value_text.c_str(), ic.header.c_str());
             evalpp.set_define(ic.name, ic.value_text);
         }
+    // Function-like macros must be in the merged table too, or every
+    // constant built through one evaluates to nothing. `#define E_FAIL
+    // _HRESULT_TYPEDEF_(0x80004005L)` is the common case: without
+    // _HRESULT_TYPEDEF_ resolvable here, the whole E_* HRESULT family was
+    // silently dropped from the winmd. First definition of a name wins,
+    // matching the object-like pass above.
+    {
+        std::set<std::string, std::less<>> fseen;
+        for (auto const& fm : st.func_macros)
+            if (!fm.name.empty() && fseen.insert(fm.name).second)
+                evalpp.set_function_macro(fm.name, fm.params, fm.value_text);
+    }
     std::set<std::string, std::less<>> seen;
     size_t materialized = 0;
     size_t n_ns_empty = 0, n_dup = 0, n_reserved = 0, n_evalfail = 0;
