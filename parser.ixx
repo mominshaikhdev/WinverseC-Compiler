@@ -1311,12 +1311,6 @@ private:
             TDef td; td.kind = is_union ? Kind::Union : Kind::Struct;
             td.ns = ns; td.name = name; td.attr = TA::Pub; td.is_union = is_union;
             td.source_header = file;
-            if (name.empty()) {
-                size_t _ps = pos > 140 ? pos - 140 : 0;
-                std::string _sc(src.substr(_ps, pos - _ps));
-                for (auto& _ch : _sc) if (_ch == '\n' || _ch == '\r') _ch = ' ';
-                std::fprintf(stderr, "[struct-noname] ...<%s>|END\n", _sc.c_str());
-            }
             parse_struct_body(src, pos, td, std::string(name), pp, items, nss, file);
             items.push_back({std::move(td), pp.current_arch(), file});
             nss.insert(ns);
@@ -1762,12 +1756,6 @@ private:
 
         if (pos < src.size() && src[pos] == '{') {
             ++pos;
-            if (name.empty()) {
-                size_t _pe = pos > 140 ? pos - 140 : 0;
-                std::string _ec(src.substr(_pe, pos - _pe));
-                for (auto& _ch : _ec) if (_ch == '\n' || _ch == '\r') _ch = ' ';
-                std::fprintf(stderr, "[enum-noname] ...<%s>|END\n", _ec.c_str());
-            }
             std::string ns = map_ns(file);
             TDef td; td.kind = Kind::Enum; td.ns = ns; td.name = name; td.attr = TA::Pub;
             td.source_header = file;
@@ -1961,16 +1949,6 @@ private:
         td.attr = TA::Pub; td.is_callback = true;
         td.source_header = file;
         td.fn_class = std::move(fn_class);
-        {
-            static const std::set<std::string_view> sc2 = {
-                "ULONG", "UCHAR", "BYTE", "WCHAR", "byte", "ulong", "uchar", "ushort", "DWORD", "UINT", "LONG", "BOOL" };
-            if (sc2.count(name)) {
-                size_t _tp2 = pos > 160 ? pos - 160 : 0;
-                std::string _tc2(src.substr(_tp2, pos - _tp2));
-                for (auto& _ch : _tc2) if (_ch == '\n' || _ch == '\r') _ch = ' ';
-                std::fprintf(stderr, "[scalar-as-fnptr] <%s>|END\n", _tc2.c_str());
-            }
-        }
         MSig sig; sig.ret = ret.elem; sig.ret_r = std::move(ret.ref);
         sig.cc = CC::Def; sig.params = std::move(params);
         td.meths.push_back(std::move(sig));
