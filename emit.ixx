@@ -680,6 +680,15 @@ private:
                 for (int i = 0; i < 8; ++i) blob.push_back((val >> (i * 8)) & 0xFF);
                 break;
             }
+            case ET::U8: {
+                // 64-bit constants (WINDOWSAPPSDK_RUNTIME_VERSION_UINT64 /
+                // PACKAGE_VERSION) need all 8 bytes LE; without this case
+                // the Constant-table blob came out EMPTY and the value was
+                // silently lost.
+                auto val = std::get<uint64_t>(v.v);
+                for (int i = 0; i < 8; ++i) blob.push_back((val >> (i * 8)) & 0xFF);
+                break;
+            }
             case ET::Bool: blob.push_back(std::get<bool>(v.v) ? 1 : 0); break;
             default: break;
         }

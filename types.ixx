@@ -361,7 +361,7 @@ struct State {
     // mode, consulted by the driver enricher after its curated name rules).
     std::unordered_map<std::string, std::string> sdk_lib_imports;
     std::unordered_map<std::string, std::string> km_lib_imports;
-    // include dir -> namespace root for its flat-C headers (map_ns appends
+    // include dir -> namespace root for its Flat-C headers (map_ns appends
     // the header stem; e.g. WASDK MRM.h -> Windows.Win32.AppSDK.MRM).
     std::unordered_map<std::string, std::string> extra_include_ns;
     std::vector<ParseError> errors;

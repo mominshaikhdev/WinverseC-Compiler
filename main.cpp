@@ -127,32 +127,30 @@ static std::string auto_detect_sdk_version(const std::string& sdk_root) {
 }
 
 static void usage() {
-    std::cout << "Winverse Compiler v1.0.0.0 - Win32 & Driver API Metadata Compiler\n"
+    std::cout << "Winverse Compiler v1.0.0.0 - Win32 & WDK API metadata compiler\n"
               << "Usage: winversec.exe [options]\n\n"
               << "Options:\n"
-              << "  -sdk <path>          Windows SDK root (default: auto-detect any drive)\n"
-              << "  -version <ver>       SDK version dir (default: auto-detect latest, e.g. 10.0.26100.0)\n"
-              << "  -output <path>       Output path: dir, file.winmd, or base name (default: Windows.Win32+Wdk.winmd)\n"
-              << "  -include_drivers     Include WDK kernel-mode driver APIs (default: on)\n"
-              << "  -no_drivers          Exclude WDK driver APIs (Win32 only)\n"
-              << "  -drivers_only        Generate Windows.Wdk.winmd (driver APIs only, no Win32)\n"
-              << "  -include_dir <dir>   Extra header dir scanned for headers the SDK lacks,\n"
-              << "                       e.g. the Windows App SDK NuGet include folder. Repeatable;\n"
-              << "                       SDK-provided headers (same stem) always win, so an SDK for\n"
-              << "                       Windows 11 22H2 (22621)+ with builtin dynamic dependency\n"
-              << "                       never collides.\n"
-              << "  -include_wasdk      Auto-locate the Windows App SDK NuGet include dir(s)\n"
-              << "                       under the machine's NuGet cache (highest version wins)\n"
-              << "                       and ingest headers the SDK lacks. SDK-provided headers\n"
-              << "                       (same stem, e.g. builtin dynamic dependency on\n"
-              << "                       Windows 11 22H2 / 22621+) always win - no double decls.\n"
-              << "  -ns <h=Namespace>    Pin a header (stem) to a namespace, overriding the\n"
-              << "                       built-in table. Repeatable. Arbitrary third-party\n"
-              << "                       header fidelity is best-effort: always check the\n"
-              << "                       coverage report / Unresolved count.\n"
-              << "  -coverage <file>     Write HTML coverage report\n"
-              << "  -verbose             Verbose output\n"
-              << "  -help                Show this help\n";
+              << "  -sdk <path>         Windows SDK root. Default: auto-detect.\n"
+              << "  -version <ver>      SDK version directory (e.g. 10.0.26100.0).\n"
+              << "                      Default: latest installed.\n"
+              << "  -output <path>      Output directory, file, or base name.\n"
+              << "                      Default: Windows.Win32+Wdk.winmd\n"
+              << "  -include_drivers    Include WDK kernel-mode APIs. Default: on.\n"
+              << "  -no_drivers         Exclude WDK APIs (Win32 only).\n"
+              << "  -drivers_only       Emit Windows.Wdk.winmd only (no Win32).\n"
+              << "  -include_dir <dir>  Add a header directory the SDK lacks (e.g. a\n"
+              << "                      Windows App SDK NuGet include folder). Repeatable;\n"
+              << "                      SDK-provided headers win on name clash.\n"
+              << "  -include_wasdk [exp]\n"
+              << "                      Ingest Windows App SDK (WASDK) Flat-C APIs\n"
+              << "                      from the NuGet cache (highest version wins).\n"
+              << "                      'exp': experimental packages only\n"
+              << "                      (-experimental*) for experimental Flat-C APIs.\n"
+              << "                      SDK-provided headers win on name clash.\n"
+              << "  -ns <h=Namespace>   Pin a header stem to a namespace. Repeatable.\n"
+              << "  -coverage <file>    Write an HTML coverage report.\n"
+              << "  -verbose            Verbose output.\n"
+              << "  -help               Show this help.\n";
 }
 
 // Read an import library (.lib) and record exported symbol -> dll name.
@@ -208,6 +206,27 @@ static void scan_import_lib(const std::filesystem::path& lib,
                 return false;
         return true;
     };
+    // A DLL module basename, as it appears before the ".dll" suffix. Unlike
+    // is_ident this MUST accept '.' and '-': real DLL names are frequently
+    // multi-segment ("Microsoft.WindowsAppRuntime.Bootstrap.dll", the WASDK
+    // bootstrap) or api-set shims ("api-ms-win-core-com-l1-1-0.dll"). Using
+    // is_ident here meant neither cur_dll nor fallback_dll was ever set for
+    // them, so the final flush("") attributed ZERO symbols: the winmd lost
+    // the ImportLibrary attribution and the downstream projection emitted an
+    // empty inline stub instead of a real extern — MddBootstrapInitialize2
+    // compiled to `return {};`, the bootstrap never ran, and every
+    // unpackaged WinUI app died with REGDB_E_CLASSNOTREG (0x80040154).
+    auto is_dll_basename = [](std::string const& s) {
+        if (s.empty() || s.size() > 240) return false;
+        if (!((s[0] >= 'A' && s[0] <= 'Z') || (s[0] >= 'a' && s[0] <= 'z') ||
+              (s[0] >= '0' && s[0] <= '9')))
+            return false;
+        for (char c : s)
+            if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                  (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-'))
+                return false;
+        return true;
+    };
     size_t i = 0;
     while (i < buf.size())
     {
@@ -222,7 +241,7 @@ static void scan_import_lib(const std::filesystem::path& lib,
         {
             std::string low = s;
             for (auto& ch : low) ch = (char)std::tolower((unsigned char)ch);
-            if (low.rfind(".dll", low.size() - 4) == low.size() - 4 && is_ident(low.substr(0, low.size() - 4)))
+            if (low.rfind(".dll", low.size() - 4) == low.size() - 4 && is_dll_basename(low.substr(0, low.size() - 4)))
             {
                 saw_import = true;
                 if (cur_dll != s) { flush(s); cur_dll = s; }
@@ -237,7 +256,7 @@ static void scan_import_lib(const std::filesystem::path& lib,
                 // import object: ucrt.lib is exactly this shape).
                 saw_import = true;
                 std::string mod = s.substr(desc.size());
-                if (is_ident(mod) && fallback_dll.empty()) fallback_dll = mod + ".dll";
+                if (is_dll_basename(mod) && fallback_dll.empty()) fallback_dll = mod + ".dll";
                 continue;
             }
         }
@@ -262,7 +281,9 @@ int main(int argc, char* argv[]) {
     std::string coverage;
     std::vector<std::string> extra_dirs;
     std::vector<std::string> ns_overrides;
-    bool include_wasdk = false;
+    // -include_wasdk / -include_wasdk exp: single mode variable, no second flag.
+    // "" = off, "std" = -include_wasdk, "exp" = -include_wasdk exp.
+    std::string include_wasdk;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -271,7 +292,20 @@ int main(int argc, char* argv[]) {
         else if (a == "-output" && i+1 < argc) { output = argv[++i]; }
         else if (a == "-include_dir" && i+1 < argc) { extra_dirs.push_back(argv[++i]); }
         else if (a == "-ns" && i+1 < argc) { ns_overrides.push_back(argv[++i]); }
-        else if (a == "-include_wasdk") include_wasdk = true;
+        else if (a == "-include_wasdk") {
+            // `-include_wasdk` (newest installed) or `-include_wasdk exp`
+            // (experimental channel only). Only that exact token is consumed,
+            // so a following switch like `-verbose` is never swallowed.
+            include_wasdk = "std";
+            if (i + 1 < argc) {
+                std::string nxt = argv[i + 1];
+                for (auto& ch : nxt) ch = (char)std::tolower((unsigned char)ch);
+                if (nxt == "exp") {
+                    include_wasdk = "exp";
+                    ++i;
+                }
+            }
+        }
         else if (a == "-include_drivers") drivers = true;
         else if (a == "-no_drivers") drivers = false;
         else if (a == "-drivers_only") { drivers_only = true; drivers = true; }
@@ -347,14 +381,19 @@ int main(int argc, char* argv[]) {
     // already provides the same header (builtin dynamic dependency on
     // Windows 11 22H2 / 22621+) wins and the NuGet copy is skipped, so
     // MddBootstrap.h etc. are never declared twice.
-    if (include_wasdk)
+    if (!include_wasdk.empty())
     {
         namespace fs = std::filesystem;
         std::vector<fs::path> roots;
         if (const char* np = std::getenv("NUGET_PACKAGES"); np && *np) roots.emplace_back(np);
         else if (const char* hp = std::getenv("USERPROFILE"); hp && *hp) roots.emplace_back(fs::path(hp) / ".nuget" / "packages");
         else if (const char* hh = std::getenv("HOME"); hh && *hh) roots.emplace_back(fs::path(hh) / ".nuget" / "packages");
-        bool found_any = false;
+        // Enumerate candidate packages first (cheap ordered directory walk),
+        // then evaluate every package on ALL CORES. Each slot records that
+        // package's include-dir pick; the merge replays picks in enumeration
+        // order, so include-dir order - and with it the first-wins header
+        // dedup - is identical to a serial scan (byte-reproducible winmd).
+        std::vector<fs::path> pkg_dirs;
         for (auto const& root : roots)
         {
             std::error_code ec;
@@ -363,69 +402,113 @@ int main(int argc, char* argv[]) {
             {
                 auto id = pkg.path().filename().string();
                 for (auto& c : id) c = (char)std::tolower((unsigned char)c);
-                if (id.rfind("microsoft.windowsappsdk", 0) != 0) continue;
-                // Newest version first (semver-ish lexicographic works for
-                // Microsoft's versioning scheme).
-                std::vector<fs::path> vers;
-                std::error_code vec;
-                for (auto const& v : fs::directory_iterator(pkg.path(), vec))
-                    if (v.is_directory()) vers.push_back(v.path());
-                // Numeric-aware version order: plain lexicographic ranks
-                // "2.3.5" above "2.3.12", which would pick an OLD package
-                // once a component crosses a two-digit minor/patch.
-                auto ver_rank = [](const std::string& v) {
-                    std::vector<int> nums;
-                    std::string tail;
-                    size_t i = 0;
-                    while (i < v.size())
-                    {
-                        if (v[i] >= '0' && v[i] <= '9')
-                        {
-                            int n = 0;
-                            while (i < v.size() && v[i] >= '0' && v[i] <= '9')
-                            {
-                                n = n * 10 + (v[i] - '0');
-                                ++i;
-                            }
-                            nums.push_back(n);
-                        }
-                        else { tail += v[i]; ++i; }  // separators + prerelease suffix
-                    }
-                    return std::make_pair(std::move(nums), std::move(tail));
-                };
-                std::sort(vers.begin(), vers.end(), [&](auto const& a, auto const& b) {
-                    return ver_rank(a.filename().string()) > ver_rank(b.filename().string());
-                });
-                for (auto const& v : vers)
-                {
-                    fs::path inc = v / "include";
-                    if (fs::is_directory(inc))
-                    {
-                        state.extra_include_dirs.push_back(inc);
-                        // WASDK package flat-C headers -> Windows.Win32.AppSDK
-                        // (nested under Windows.Win32 so the flat-C AppSDK APIs
-                        // sit alongside the rest of the Win32 projection rather
-                        // than under a Microsoft.* root of their own)
-                        state.extra_include_ns[inc.lexically_normal().generic_string()] =
-                            "Windows.Win32.AppSDK";
-                        found_any = true;
-                        if (verbose) std::cout << "WASDK include: " << inc.string() << "\n";
-                        break;  // highest version with an include dir wins
-                    }
-                }
+                if (id.rfind("microsoft.windowsappsdk", 0) == 0)
+                    pkg_dirs.push_back(pkg.path());
             }
         }
+        // Numeric-aware version order: plain lexicographic ranks "2.3.5"
+        // above "2.3.12", which would pick an OLD package once a component
+        // crosses a two-digit minor/patch. Hoisted so the parallel pass
+        // shares one definition.
+        auto ver_rank = [](const std::string& v) {
+            std::vector<int> nums;
+            std::string tail;
+            size_t i = 0;
+            while (i < v.size())
+            {
+                if (v[i] >= '0' && v[i] <= '9')
+                {
+                    int n = 0;
+                    while (i < v.size() && v[i] >= '0' && v[i] <= '9')
+                    {
+                        n = n * 10 + (v[i] - '0');
+                        ++i;
+                    }
+                    nums.push_back(n);
+                }
+                else { tail += v[i]; ++i; }  // separators + prerelease suffix
+            }
+            return std::make_pair(std::move(nums), std::move(tail));
+        };
+        std::vector<fs::path> picks(pkg_dirs.size());   // empty = no include dir
+        std::vector<size_t> work(pkg_dirs.size());
+        for (size_t i = 0; i < work.size(); ++i) work[i] = i;
+        auto t_wasdk = std::chrono::steady_clock::now();
+        std::for_each(std::execution::par, work.begin(), work.end(), [&](size_t pi) {
+            std::error_code vec;
+            std::vector<fs::path> vers;
+            for (auto const& v : fs::directory_iterator(pkg_dirs[pi], vec))
+                if (v.is_directory()) vers.push_back(v.path());
+            // `-include_wasdk exp`: experimental channel only. Keep version
+            // dirs tagged "-experimental" (2.5.4-experimental,
+            // 2.0.250912002-experimental, ...) and skip stable releases, so
+            // the newest installed EXPERIMENTAL package - the one carrying
+            // experimental Flat-C APIs - is what gets ingested.
+            if (include_wasdk == "exp")
+            {
+                std::vector<fs::path> exp_vers;
+                for (auto const& v : vers)
+                {
+                    auto nm = v.filename().string();
+                    for (auto& c : nm) c = (char)std::tolower((unsigned char)c);
+                    if (nm.find("-experimental") != std::string::npos)
+                        exp_vers.push_back(v);
+                }
+                vers = std::move(exp_vers);
+            }
+            std::sort(vers.begin(), vers.end(), [&](auto const& a, auto const& b) {
+                return ver_rank(a.filename().string()) > ver_rank(b.filename().string());
+            });
+            for (auto const& v : vers)
+            {
+                fs::path inc = v / "include";
+                if (fs::is_directory(inc))
+                {
+                    picks[pi] = inc;
+                    break;  // highest version with an include dir wins
+                }
+            }
+        });
+        bool found_any = false;
+        for (size_t pi = 0; pi < pkg_dirs.size(); ++pi)
+        {
+            if (picks[pi].empty()) continue;
+            fs::path const& inc = picks[pi];
+            state.extra_include_dirs.push_back(inc);
+            // WASDK package Flat-C headers -> Windows.Win32.AppSDK
+            // (nested under Windows.Win32 so the Flat-C AppSDK APIs
+            // sit alongside the rest of the Win32 projection rather
+            // than under a Microsoft.* root of their own)
+            state.extra_include_ns[inc.lexically_normal().generic_string()] =
+                "Windows.Win32.AppSDK";
+            found_any = true;
+            if (verbose) std::cout << "WASDK include" << (include_wasdk == "exp" ? " (exp)" : "")
+                                  << ": " << inc.string() << "\n";
+        }
+        if (verbose)
+            std::cout << "WASDK search: "
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - t_wasdk).count()
+                      << " ms (all-core, " << pkg_dirs.size() << " packages)\n";
         if (!found_any)
-            std::cerr << "WARNING: -include_wasdk: no Windows App SDK NuGet include dir found"
-                         " (looked in the NuGet cache; restore a WASDK-based project first).\n";
+            std::cerr << "WARNING: "
+                      << (include_wasdk == "exp"
+                              ? "-include_wasdk exp: no experimental Windows App SDK NuGet "
+                                "package found (looked in the NuGet cache; restore a "
+                                "WASDK-based project first).\n"
+                              : "-include_wasdk: no Windows App SDK NuGet include dir found "
+                                "(looked in the NuGet cache; restore a WASDK-based project "
+                                "first).\n");
     }
     for (auto const& d : extra_dirs) state.extra_include_dirs.emplace_back(d);
-    // Automatic flat-C dll discovery: scan each extra include dir's sibling
+    // Automatic Flat-C dll discovery: scan each extra include dir's sibling
     // NuGet lib dir (<pkg>/lib/native/<arch>) and record symbol -> dll from
     // the import libraries; arch precedence x64 > x86 > arm64 > arm64ec.
     {
         namespace fs2 = std::filesystem;
         static const char* arches[] = { "x64", "x86", "arm64", "arm64ec" };
+        auto t_libs = std::chrono::steady_clock::now();
+        size_t nlibs = 0;
         for (auto const& incd : state.extra_include_dirs)
         {
             std::error_code ec;
@@ -434,19 +517,42 @@ int main(int argc, char* argv[]) {
             {
                 fs2::path libdir = pkg / "lib" / "native" / arch;
                 if (!fs2::is_directory(libdir, ec)) continue;
+                // Collect this directory's .lib files (iteration order kept),
+                // scan them on ALL CORES into per-file maps, then merge in the
+                // collected order - identical first-wins results to a serial
+                // scan, so the winmd stays byte-reproducible.
+                std::vector<fs2::path> libs;
                 for (auto const& e : fs2::directory_iterator(libdir, ec))
                 {
                     if (!e.is_regular_file(ec)) continue;
                     auto ext = e.path().extension().string();
                     for (auto& c : ext) c = (char)std::tolower((unsigned char)c);
                     if (ext != ".lib") continue;
-                    scan_import_lib(e.path(), state.dll_imports);
-                    if (verbose) std::cout << "scanned import lib: " << e.path().string()
+                    libs.push_back(e.path());
+                }
+                std::vector<std::unordered_map<std::string, std::string>> per_file(libs.size());
+                std::vector<size_t> work(libs.size());
+                for (size_t i = 0; i < work.size(); ++i) work[i] = i;
+                std::for_each(std::execution::par, work.begin(), work.end(),
+                    [&](size_t i) { scan_import_lib(libs[i], per_file[i]); });
+                for (size_t i = 0; i < libs.size(); ++i)
+                {
+                    for (auto& [sym, dll] : per_file[i])
+                        if (!state.dll_imports.contains(sym))
+                            state.dll_imports.emplace(sym, dll);
+                    if (verbose) std::cout << "scanned import lib: " << libs[i].string()
                                            << " (" << state.dll_imports.size() << " symbols so far)\n";
                 }
+                nlibs += libs.size();
                 break;  // first (highest-precedence) arch present wins
             }
         }
+        if (verbose)
+            std::cout << "import-lib discovery: "
+                      << std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - t_libs).count()
+                      << " ms (all-core, " << nlibs << " libs, "
+                      << state.dll_imports.size() << " symbols)\n";
     }
     // Automatic Windows SDK import-lib discovery: scan the SDK's own import
     // libraries (um + ucrt for user mode, km for kernel mode) and record

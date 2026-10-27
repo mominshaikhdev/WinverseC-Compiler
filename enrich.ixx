@@ -182,7 +182,7 @@ inline void Enricher::materialize_int_consts()
         if (ic.ns.empty()) { ++n_ns_empty; continue; }
         if (!seen.insert(ic.name).second) { ++n_dup; continue; }
         if (reserved.contains(ic.name)) { ++n_reserved; continue; }
-        uint32_t cval = 0;
+        uint64_t cval = 0;
         if (!evalpp.eval_macro_int(ic.value_text, cval)) {
             ++n_evalfail;
             if (st.verbose)
@@ -199,9 +199,20 @@ inline void Enricher::materialize_int_consts()
         FDef f;
         f.name = ic.name;
         f.attr = FA::Pub | FA::Literal | FA::InitOnly;
-        f.type = ET::U4;
-        f.def.type = ET::U4;
-        f.def.v = cval;
+        // Width follows the evaluated value: <= 32 bits stays U4 (the
+        // common case); anything wider - WINDOWSAPPSDK_RUNTIME_VERSION_UINT64
+        // (0x0002000500040000) and whatever a future header defines - emits
+        // U8. The value always comes from the scanned header, never from
+        // winversec source, so new constants need no compiler recompile.
+        if (cval <= 0xFFFFFFFFull) {
+            f.type = ET::U4;
+            f.def.type = ET::U4;
+            f.def.v = (uint32_t)cval;
+        } else {
+            f.type = ET::U8;
+            f.def.type = ET::U8;
+            f.def.v = cval;
+        }
         td.fields.push_back(std::move(f));
         st.items.push_back({ std::move(td), Ar::All, ic.header });
         st.nss.insert(ic.ns);

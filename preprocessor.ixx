@@ -189,39 +189,51 @@ public:
         }
         return false;
     }
-    bool eval_or(std::string_view s, uint32_t& out) const {
+    // The whole chain evaluates in 64 bits. WindowsAppSDK-VersionInfo.h
+    // defines WINDOWSAPPSDK_RUNTIME_VERSION_UINT64 = 0x0002000500040000u
+    // (PACKAGE_VERSION) and future headers define wider values still; a
+    // 32-bit chain silently mangled them (strtoul overflow), which would
+    // have forced hardcoding the value in winversec - a recompile per
+    // release. 64-bit math is a superset: every 32-bit constant evaluates
+    // identically, and the uint32_t eval_macro_int overload narrows at the
+    // edge for existing callers.
+    bool eval_or(std::string_view s, uint64_t& out) const {
         std::string_view lhs, rhs;
         if (eval_split1(s, '|', lhs, rhs)) {
-            uint32_t a = 0, b = 0;
+            uint64_t a = 0, b = 0;
             return eval_or(lhs, a) && eval_or(rhs, b) && ((out = a | b), true);
         }
         return eval_xor(s, out);
     }
-    bool eval_xor(std::string_view s, uint32_t& out) const {
+    bool eval_xor(std::string_view s, uint64_t& out) const {
         std::string_view lhs, rhs;
         if (eval_split1(s, '^', lhs, rhs)) {
-            uint32_t a = 0, b = 0;
+            uint64_t a = 0, b = 0;
             return eval_xor(lhs, a) && eval_xor(rhs, b) && ((out = a ^ b), true);
         }
         return eval_and(s, out);
     }
-    bool eval_and(std::string_view s, uint32_t& out) const {
+    bool eval_and(std::string_view s, uint64_t& out) const {
         std::string_view lhs, rhs;
         if (eval_split1(s, '&', lhs, rhs)) {
-            uint32_t a = 0, b = 0;
+            uint64_t a = 0, b = 0;
             return eval_and(lhs, a) && eval_and(rhs, b) && ((out = a & b), true);
         }
-        return eval_shift(s, out);
+        return eval_shift_val(s, out);
     }
-    bool eval_shift(std::string_view s, uint32_t& out) const {
+    // *_val suffix: the class already has the #if SCANNER family
+    // (eval_shift/eval_primary taking size_t&). On x64 size_t IS uint64_t,
+    // so same-name + same-params would be a redefinition differing only by
+    // return type (C2556). The scanner family is untouched.
+    bool eval_shift_val(std::string_view s, uint64_t& out) const {
         std::string_view lhs, rhs;
         if (eval_split2(s, '<', '<', lhs, rhs)) {
-            uint32_t a = 0, b = 0;
-            return eval_shift(lhs, a) && eval_primary(rhs, b) && ((out = a << b), true);
+            uint64_t a = 0, b = 0;
+            return eval_shift_val(lhs, a) && eval_primary_val(rhs, b) && ((out = a << b), true);
         }
         if (eval_split2(s, '>', '>', lhs, rhs)) {
-            uint32_t a = 0, b = 0;
-            return eval_shift(lhs, a) && eval_primary(rhs, b) && ((out = a >> b), true);
+            uint64_t a = 0, b = 0;
+            return eval_shift_val(lhs, a) && eval_primary_val(rhs, b) && ((out = a >> b), true);
         }
         return eval_addsub(s, out);
     }
@@ -233,7 +245,7 @@ public:
     // Split at the LAST top-level +/- (left-associative via recursion);
     // reject a split whose lhs ENDS with an operator ('1+-2', 'A<<-1')
     // so the sign stays unary and the digit path sees the whole atom.
-    bool eval_addsub(std::string_view s, uint32_t& out) const {
+    bool eval_addsub(std::string_view s, uint64_t& out) const {
         int depth = 0;
         for (size_t i = s.size(); i-- > 0;) {
             char c = s[i];
@@ -255,8 +267,8 @@ public:
                 eval_trim(lhs);
                 eval_trim(rhs);
                 if (lhs.empty() || rhs.empty()) continue;
-                uint32_t a = 0, b = 0;
-                if (eval_addsub(lhs, a) && eval_primary(rhs, b)) {
+                uint64_t a = 0, b = 0;
+                if (eval_addsub(lhs, a) && eval_primary_val(rhs, b)) {
                     out = (c == '+') ? a + b : a - b;
                     return true;
                 }
@@ -265,9 +277,9 @@ public:
                 // nested cast may split differently) — keep scanning
             }
         }
-        return eval_primary(s, out);
+        return eval_primary_val(s, out);
     }
-    bool eval_primary(std::string_view s, uint32_t& out) const {
+    bool eval_primary_val(std::string_view s, uint64_t& out) const {
         eval_trim(s);
         if (s.empty()) return false;
         // Unwrap redundant parentheses: "(0x10)" -> "0x10",
@@ -316,13 +328,16 @@ public:
         // Unary minus / plus / complement.
         if (s.front() == '-' || s.front() == '+' || s.front() == '~') {
             char op = s.front();
-            uint32_t v = 0;
-            if (!eval_primary(s.substr(1), v)) return false;
-            out = (op == '-') ? (uint32_t)(0u - v) : (op == '~') ? (uint32_t)~v : v;
+            uint64_t v = 0;
+            if (!eval_primary_val(s.substr(1), v)) return false;
+            out = (op == '-') ? (uint64_t)(0u - v) : (op == '~') ? (uint64_t)~v : v;
             return true;
         }
         if (std::isdigit((unsigned char)s.front())) {
-            out = (uint32_t)std::strtoul(std::string(s).c_str(), nullptr, 0);
+            // strtoull, not strtoul: 64-bit literals (PACKAGE_VERSION
+            // UINT64 values) must survive intact; unsigned long is 32-bit
+            // on Windows and overflowed to garbage.
+            out = (uint64_t)std::strtoull(std::string(s).c_str(), nullptr, 0);
             return true;
         }
         // Function-like macro invocation: `NAME(arg, ...)`. The SDK builds
@@ -374,7 +389,16 @@ public:
             return eval_macro_int(it->second.value, out); // capped entry
         return false;
     }
+    // 32-bit entry point kept for existing callers (#if evaluation, CTL_CODE
+    // parts, the parser's IRP_MJ capture): evaluates through the 64-bit
+    // chain, then narrows.
     bool eval_macro_int(std::string_view s, uint32_t& out) const {
+        uint64_t wide = 0;
+        if (!eval_macro_int(s, wide)) return false;
+        out = (uint32_t)wide;
+        return true;
+    }
+    bool eval_macro_int(std::string_view s, uint64_t& out) const {
         // Recursion cap: the merged post-parse define table contains
         // mutual references; 64 frames is far beyond any real constant
         // chain (the longest observed WS_*/DSBCAPS_* nests use <10).

@@ -1,6 +1,6 @@
 # WINVERSE COMPILER
 
-A high-performance Win32 and Driver API metadata compiler, implemented in C++23 modules using MSVC. Produces ECMA-335 `.winmd` files directly from Windows SDK C/C++ headers with complete semantic attribution, enabling precise language projections from any target language.
+A high-performance Win32, Driver API, and Windows App SDK (WASDK) Flat-C API metadata compiler, implemented in C++23 modules using MSVC. Produces ECMA-335 `.winmd` files directly from Windows SDK C/C++ headers with complete semantic attribution, enabling precise language projections from any target language. `-include_wasdk` (or `-include_wasdk exp` for the experimental channel) additionally ingests the WASDK NuGet packages' Flat-C headers and import libraries into `Windows.Win32.AppSDK.*`.
 
 ## Overview
 
@@ -455,6 +455,24 @@ NuGet cache (`NUGET_PACKAGES`, then `~/.nuget/packages`), highest version
 first, and scans their `include/` dirs **for headers the Windows SDK does not
 already provide** (dedup by file stem, case-insensitive).
 
+**Experimental channel — `-include_wasdk exp`:** adding the optional `exp`
+argument restricts ingestion to experimental packages (version directories
+tagged `-experimental*`, e.g. `2.5.4-experimental`); the newest installed
+experimental version wins and stable releases are skipped. This is how
+experimental Flat-C WASDK APIs reach the winmd. `-include_wasdk` alone keeps
+the default newest-version behavior.
+
+```batch
+:: Experimental Flat-C WASDK APIs only (e.g. 2.5.4-experimental)
+winversec.exe -include_wasdk exp -output Windows.Win32.winmd
+```
+
+Version-dependent constants (`WINDOWSAPPSDK_RELEASE_MAJORMINOR`,
+`WINDOWSAPPSDK_RUNTIME_VERSION_UINT64`, ...) are evaluated from the scanned
+package's own headers (`WindowsAppSDK-VersionInfo.h`) at generation time —
+32- and 64-bit values both land in the winmd — so a future WASDK release
+never requires rebuilding winversec.
+
 Why the dedup matters: from Windows 11 22H2 (build 22621) the Windows SDK
 ships its own dynamic-dependency headers (`MddBootstrap.h`, plus the OS-level
 `TryCreatePackageDependency` API in `appmodel.h`). When the SDK provides a
@@ -470,7 +488,7 @@ the official win32metadata homes:
 **Flat-C WindowsAppSDK APIs — automatic namespaces and DLL imports:** every other WASDK header needs no table entry:
 
 - **Namespace**: `Windows.Win32.AppSDK.<HeaderStem>` (`MRM.h` ->
-  `Windows.Win32.AppSDK.MRM`), so the flat-C AppSDK APIs sit alongside the
+  `Windows.Win32.AppSDK.MRM`), so the Flat-C AppSDK APIs sit alongside the
   rest of the Win32 projection rather than under a `Microsoft.*` root of
   their own. WASDK headers are named after the API they expose
   (`Microsoft.UI.Dispatching.Interop.h`), so any leading `Microsoft`,
@@ -482,7 +500,7 @@ the official win32metadata homes:
 - **DLL import**: each package's import libs (`lib/native/x64/*.lib`,
   then x86/arm64/arm64ec) are scanned for exported symbols; the dll name
   comes from the import descriptor in the binary (`MrmCreateResourceManager`
-  -> `MRM.dll`), so new flat-C APIs get their import the day they ship.
+  -> `MRM.dll`), so new Flat-C APIs get their import the day they ship.
   Consulted after the built-in dll table.
 
 ### Extra Header Directories (-include_dir)
@@ -522,7 +540,7 @@ winversec.exe -include_drivers -coverage coverage.html
 | `-include_drivers` | Include WDK `km/` + `Include\wdf\` framework headers | on |
 | `-no_drivers` | Exclude WDK driver APIs (Win32 only) | off |
 | `-drivers_only` | Only `km/` + `shared/` + `Include\wdf\`, skip `um/` | off |
-| `-include_wasdk` | Auto-ingest WASDK NuGet headers the SDK lacks | off |
+| `-include_wasdk [exp]` | Auto-ingest WASDK NuGet headers the SDK lacks; `exp` = experimental packages only | off |
 | `-include_dir <dir>` | Extra header dir, repeatable (SDK stems win) | none |
 | `-ns <h=Namespace>` | Pin a header stem to a namespace, repeatable | none |
 | `-coverage <file>` | HTML coverage report | none |
